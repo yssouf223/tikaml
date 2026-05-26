@@ -25,6 +25,7 @@ from scipy.stats import poisson
 
 from src.lgbm_poisson import LGBMPoissonModel, FEATURE_COLS, CORNER_FEATURE_COLS, YELLOW_FEATURE_COLS
 from src.live_predictor import LivePredictor
+from src import national_api
 
 # ─── Config ────────────────────────────────────────────────────────
 
@@ -108,6 +109,13 @@ async def lifespan(app: FastAPI):
         backfill_models.version = "lgbm-poisson-backfill-20260131"
         log.info("  Backfill models loaded")
 
+    # National-team (World Cup 2026) model — optional, self-contained
+    try:
+        nm = national_api.load_national()
+        log.info(f"  National model loaded ({len(nm.attack)} teams)")
+    except Exception as e:
+        log.warning(f"  National model not loaded: {e}")
+
     log.info(f"  All models loaded in {time.time() - t0:.1f}s")
     yield
     log.info("Shutting down")
@@ -120,6 +128,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# National-team (World Cup) routes, under /national, same X-API-Key auth.
+app.include_router(national_api.router, dependencies=[Depends(verify_api_key)])
 
 
 # ─── Request / Response schemas ────────────────────────────────────
@@ -460,5 +471,9 @@ async def model_status():
         "backfill": {
             "loaded": backfill_models.goals is not None,
             "version": backfill_models.version,
+        },
+        "national": {
+            "loaded": national_api.state.model is not None,
+            "teams": len(national_api.state.model.attack) if national_api.state.model else 0,
         },
     }
