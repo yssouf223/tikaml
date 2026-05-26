@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from src.national_poisson import NationalTeamModel
 from src.national_simulate import TournamentSimulator, OFFICIAL_GROUPS, derive_bracket
@@ -66,6 +66,18 @@ class NationalPredictRequest(BaseModel):
     away_goals: int = 0
     home_red_cards: int = 0
     away_red_cards: int = 0
+    # live only: 90 = regulation, 120 = knockout tie gone to extra time. The
+    # caller switches to 120 when the live feed reports extra time so the engine
+    # keeps a remaining-goals rate through minute 120 instead of treating the
+    # match as decided at 90.
+    total_minutes: int = 90
+
+    @field_validator("total_minutes")
+    @classmethod
+    def _check_total_minutes(cls, v: int) -> int:
+        if v not in (90, 120):
+            raise ValueError("total_minutes must be 90 (regulation) or 120 (extra time)")
+        return v
 
 
 class NationalSimulateRequest(BaseModel):
@@ -148,7 +160,8 @@ def _live_block(req: NationalPredictRequest) -> dict:
     out = live_predict(state.model, req.home_team, req.away_team, req.neutral,
                        req.minute, req.home_goals, req.away_goals,
                        home_red_cards=req.home_red_cards,
-                       away_red_cards=req.away_red_cards)
+                       away_red_cards=req.away_red_cards,
+                       total_minutes=req.total_minutes)
     p = out["probs_1x2"]
     lh, la = out["lambda_prematch"]
     lrh, lra = out["lambda_remaining"]

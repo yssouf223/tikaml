@@ -11,7 +11,7 @@ from src.live_predictor import LivePredictor
 
 def live_predict(model, home_team, away_team, neutral, minute,
                  home_goals, away_goals, home_red_cards=0, away_red_cards=0,
-                 lambda_home=None, lambda_away=None):
+                 lambda_home=None, lambda_away=None, total_minutes=90):
     """Update the live prediction given the current match state.
 
     Call again after every goal / red card (or every minute) with the new
@@ -24,6 +24,9 @@ def live_predict(model, home_team, away_team, neutral, minute,
         home_red_cards, away_red_cards: red cards so far.
         lambda_home, lambda_away: optional pre-computed pre-match lambdas
             (pass them to avoid recomputing across repeated live calls).
+        total_minutes: match length. 90 for regulation; pass 120 once a knockout
+            tie has gone to extra time, so the engine keeps a live remaining-goals
+            rate through minute 120 instead of declaring the match over at 90.
 
     Returns: live probability dict (see LivePredictor.get_probabilities) plus
         the pre-match lambdas used.
@@ -31,7 +34,8 @@ def live_predict(model, home_team, away_team, neutral, minute,
     if lambda_home is None or lambda_away is None:
         lambda_home, lambda_away = model.predict_lambdas(home_team, away_team, neutral)
     lp = LivePredictor(lambda_home, lambda_away,
-                       rho=(model.rho if model.rho is not None else -0.10))
+                       rho=(model.rho if model.rho is not None else -0.10),
+                       total_minutes=total_minutes)
     lp.update(minute=minute, home_goals=home_goals, away_goals=away_goals,
               home_red_cards=home_red_cards, away_red_cards=away_red_cards)
     out = lp.get_probabilities()

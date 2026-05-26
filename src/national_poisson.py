@@ -171,6 +171,11 @@ class NationalTeamModel:
         p_draw = np.trace(matrix)
         p_away = np.triu(matrix, 1).sum()
         probs = np.array([p_home, p_draw, p_away]); probs /= probs.sum()
+        # NOTE: served 1x2 is the raw matrix-derived vector (no temperature),
+        # matching the served five-league club model. Temperature was evaluated
+        # (experiments/national/calibrate_temperature.py) and rejected: nested
+        # leave-one-WC-out CV showed sharpening overfits and worsens out-of-sample
+        # RPS/log-loss/Brier, so self.temperature is left unused at T=1.0.
 
         flat = matrix.flatten()
         top_scores = []
