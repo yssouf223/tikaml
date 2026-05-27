@@ -91,6 +91,13 @@ class NationalSimulateRequest(BaseModel):
     bracket: dict[int, list[str]] | None = None
 
 
+class NationalBracketRequest(BaseModel):
+    # complete group results [[home, away, home_goals, away_goals], ...]; must
+    # cover every group match (each team 3 games) or the bracket can't be derived
+    played: list[list]
+    seed: int = 0                        # tie-break the rare multi-solution third slotting
+
+
 # ─── helpers ───────────────────────────────────────────────────────
 
 def _ou(ou: dict) -> dict:
@@ -254,6 +261,27 @@ async def national_simulate(req: NationalSimulateRequest):
     except AssertionError as e:
         raise HTTPException(status_code=400, detail=f"invalid simulation input: {e}")
     return {"n_sims": req.n_sims, "teams": table.round(4).to_dict(orient="records")}
+
+
+@router.post("/bracket")
+async def national_bracket(req: NationalBracketRequest):
+    """Resolve the 16 Round-of-32 match-ups from a COMPLETE group stage.
+
+    Applies FIFA's official template + the constraint-respecting best-third
+    slotting (the same `derive_bracket` /simulate uses internally), exposed so
+    the data pipeline can fill its bracket table without re-implementing the
+    495-combination third-place matching. Returns {match_no: [team1, team2]}
+    for matches 73-88; feed it straight back to /simulate's `bracket` for
+    knockout odds consistent with the displayed tree. 400 if the group stage is
+    incomplete or a fixture is unknown."""
+    if state.model is None:
+        raise HTTPException(status_code=503, detail="National model not loaded")
+    played = _parse_played(req.played)
+    try:
+        bracket = derive_bracket(state.groups, played, seed=req.seed)
+    except AssertionError as e:
+        raise HTTPException(status_code=400, detail=f"cannot derive bracket: {e}")
+    return {"bracket": {str(m): [t1, t2] for m, (t1, t2) in bracket.items()}}
 
 
 @router.get("/ratings")
