@@ -1,0 +1,12 @@
+# 离线训练 / 验证依赖。
+#
+# 生产镜像装的是 requirements-server.txt，只走 lgb.Booster 推理路径，
+# 不需要 scikit-learn。但训练用的 lgb.LGBMRegressor 强依赖它——
+# 缺了会在 fit() 时抛 LightGBMError: scikit-learn is required for lightgbm.sklearn。
+#
+# 用法: uv pip install -r requirements-server.txt -r requirements-train.txt
+
+-r requirements-server.txt
+
+scikit-learn>=1.3   # lgb.LGBMRegressor / early stopping 回调
+optuna>=3.0         # scripts/tune_lgbm.py 调参

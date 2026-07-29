@@ -14,6 +14,8 @@ build/
 
 # Raw data (not for distribution)
 data/opta/raw/
+# Polymarket 五大联赛 25/26 分钟级价格序列 + 深度快照（74MB）
+data/polymarket/
 data/opta/etl_log.txt
 data/opta/processed/season_ids.json
 data/odds/
@@ -31,3 +33,14 @@ experiments/scripts/build_features.py
 # IDE / tools
 .kaggle/
 .claude/
+
+# 特征表副本（features.csv 本体已入库，衍生版本不入——都是 40MB 级）
+data/opta/processed/features_v*.csv
+data/opta/processed/features_odds_fixed.csv
+data/opta/processed/features_backup_*.csv
+
+# 指向本地绝对路径的软链，对他人无效
+experiments/data
+
+# 实验结果输出
+experiments/results/
