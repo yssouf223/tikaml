@@ -1,19 +1,19 @@
-"""Prediction service API.
+"""
+TikaML Prediction Service
+GAGNE TEMPS - OpenFootball Edition
 
-FastAPI server that loads trained models and serves predictions
-for the tikaml-data-service.
+Sources:
+- OpenFootball football.json: fixtures + historical/current results
+- TikaML: LightGBM + Poisson prediction engine
 
-GAGNE TEMPS:
-- Automatic daily fixtures from API-Football
-- Current standings and form
-- H2H
-- Pre-match 1X2 odds
-- TikaML predictions
-- Confidence/ranking layer
-- TOP 5 daily predictions
+No API-Football dependency for GAGNE TEMPS.
 
-IMPORTANT:
-API_FOOTBALL_KEY and TIKA_API_KEY must remain server-side.
+OpenFootball:
+https://github.com/openfootball/football.json
+
+Important:
+- TIKA_API_KEY remains server-side.
+- No football external API key is required.
 """
 
 import json
@@ -27,7 +27,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -43,9 +42,9 @@ from src import national_api
 from src.inference import MatchPredictor
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,28 +62,17 @@ BACKFILL_DIR = Path("models/backfill_20260131")
 MAX_GOALS = 7
 
 
-# ═══════════════════════════════════════════════════════════════════
-# API KEYS
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
+# TIKA API KEY
+# ================================================================
 
 API_KEY = os.environ.get("TIKA_API_KEY", "")
 
 if not API_KEY:
     API_KEY = secrets.token_urlsafe(32)
-
     log.warning(
-        "No TIKA_API_KEY set, generated temporary API key."
+        "No TIKA_API_KEY configured. Temporary key generated."
     )
-
-
-API_FOOTBALL_KEY = os.environ.get(
-    "API_FOOTBALL_KEY",
-    "",
-)
-
-API_FOOTBALL_URL = (
-    "https://v3.football.api-sports.io"
-)
 
 
 api_key_header = APIKeyHeader(
@@ -96,8 +84,6 @@ api_key_header = APIKeyHeader(
 async def verify_api_key(
     key: str = Security(api_key_header),
 ):
-    """Validate the TikaML API key."""
-
     if (
         not key
         or not secrets.compare_digest(
@@ -113,137 +99,111 @@ async def verify_api_key(
     return key
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # SUPPORTED LEAGUES
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 SUPPORTED_LEAGUES = {
 
-    39: {
+    "EPL": {
         "name": "Premier League",
-        "tika_code": "EPL",
+        "file": "en.1.json",
+        "openfootball_code": "en.1",
     },
 
-    140: {
+    "LL": {
         "name": "La Liga",
-        "tika_code": "LL",
+        "file": "es.1.json",
+        "openfootball_code": "es.1",
     },
 
-    135: {
+    "SEA": {
         "name": "Serie A",
-        "tika_code": "SEA",
+        "file": "it.1.json",
+        "openfootball_code": "it.1",
     },
 
-    78: {
+    "BUN": {
         "name": "Bundesliga",
-        "tika_code": "BUN",
+        "file": "de.1.json",
+        "openfootball_code": "de.1",
     },
 
-    61: {
+    "LI1": {
         "name": "Ligue 1",
-        "tika_code": "LI1",
+        "file": "fr.1.json",
+        "openfootball_code": "fr.1",
     },
 }
 
 
-# ═══════════════════════════════════════════════════════════════════
-# CACHE
-# ═══════════════════════════════════════════════════════════════════
-
-FIXTURE_CACHE = {
-    "date": None,
-    "timestamp": 0,
-    "fixtures": None,
-}
-
-FIXTURE_CACHE_SECONDS = 300
+OPENFOOTBALL_BASE_URL = (
+    "https://raw.githubusercontent.com/"
+    "openfootball/football.json/master"
+)
 
 
-DATA_CACHE = {
-    "standings": {},
-    "h2h": {},
-    "odds": {},
-}
+# ================================================================
+# OPENFOOTBALL CACHE
+# ================================================================
+
+OPENFOOTBALL_CACHE = {}
+
+OPENFOOTBALL_CACHE_SECONDS = 1800
 
 
-STANDINGS_CACHE_SECONDS = 3600
-H2H_CACHE_SECONDS = 21600
-ODDS_CACHE_SECONDS = 900
-
-
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # MODEL CONTAINERS
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 class Models:
 
     goals: LGBMPoissonModel | None = None
-
     corners: LGBMPoissonModel | None = None
-
     yellows: LGBMPoissonModel | None = None
-
     version: str = "unknown"
 
 
 models = Models()
 backfill_models = Models()
 
-
-# ═══════════════════════════════════════════════════════════════════
-# GAGNE TEMPS PREDICTOR
-# ═══════════════════════════════════════════════════════════════════
-
 club_predictor: MatchPredictor | None = None
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # REQUEST SCHEMAS
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 class GagneTempsRequest(BaseModel):
 
     home_team: str
-
     away_team: str
-
     league: str
-
     season: str
-
     match_date: str
-
     week: int | None = None
 
 
 class MatchContext(BaseModel):
 
     minute: int | None = None
-
     second: int = 0
-
     period: str | None = None
-
     status: str | None = None
 
     home_score: int = 0
-
     away_score: int = 0
 
     home_team_id: str | None = None
-
     away_team_id: str | None = None
 
     home_red_cards: int = 0
-
     away_red_cards: int = 0
 
     home_corners: int = 0
-
     away_corners: int = 0
 
     home_yellows: int = 0
-
     away_yellows: int = 0
 
 
@@ -273,18 +233,15 @@ class PredictionRequest(BaseModel):
 class PredictionResponse(BaseModel):
 
     predictions: dict
-
     model_metadata: dict
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # LIFESPAN
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
-    """Load all models on startup."""
 
     global club_predictor
 
@@ -292,23 +249,17 @@ async def lifespan(app: FastAPI):
 
     t0 = time.time()
 
-    # ───────────────────────────────────────────────────────────────
     # GOALS
-    # ───────────────────────────────────────────────────────────────
-
     models.goals = LGBMPoissonModel.load(
         str(MODEL_DIR)
     )
 
     log.info(
-        f"  Goals model loaded "
+        f"Goals model loaded "
         f"({len(models.goals.feature_cols)} features)"
     )
 
-    # ───────────────────────────────────────────────────────────────
     # CORNERS
-    # ───────────────────────────────────────────────────────────────
-
     if CORNER_MODEL_DIR.exists():
 
         models.corners = LGBMPoissonModel.load(
@@ -316,14 +267,11 @@ async def lifespan(app: FastAPI):
         )
 
         log.info(
-            f"  Corners model loaded "
+            f"Corners model loaded "
             f"({len(models.corners.feature_cols)} features)"
         )
 
-    # ───────────────────────────────────────────────────────────────
     # YELLOWS
-    # ───────────────────────────────────────────────────────────────
-
     if YELLOW_MODEL_DIR.exists():
 
         models.yellows = LGBMPoissonModel.load(
@@ -331,20 +279,16 @@ async def lifespan(app: FastAPI):
         )
 
         log.info(
-            f"  Yellows model loaded "
+            f"Yellows model loaded "
             f"({len(models.yellows.feature_cols)} features)"
         )
 
-    # ───────────────────────────────────────────────────────────────
     # VERSION
-    # ───────────────────────────────────────────────────────────────
-
     meta_path = MODEL_DIR / "meta.json"
 
     if meta_path.exists():
 
-        with open(meta_path) as f:
-
+        with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
 
         models.version = (
@@ -352,37 +296,31 @@ async def lifespan(app: FastAPI):
             f"{len(meta.get('feature_cols', []))}f"
         )
 
-    # ───────────────────────────────────────────────────────────────
     # BACKFILL
-    # ───────────────────────────────────────────────────────────────
-
     if BACKFILL_DIR.exists():
 
-        bf_goals_dir = BACKFILL_DIR / "goals"
-        bf_corners_dir = BACKFILL_DIR / "corners"
-        bf_yellows_dir = BACKFILL_DIR / "yellows"
+        bf_goals = BACKFILL_DIR / "goals"
+        bf_corners = BACKFILL_DIR / "corners"
+        bf_yellows = BACKFILL_DIR / "yellows"
 
-        if bf_goals_dir.exists():
-
+        if bf_goals.exists():
             backfill_models.goals = (
                 LGBMPoissonModel.load(
-                    str(bf_goals_dir)
+                    str(bf_goals)
                 )
             )
 
-        if bf_corners_dir.exists():
-
+        if bf_corners.exists():
             backfill_models.corners = (
                 LGBMPoissonModel.load(
-                    str(bf_corners_dir)
+                    str(bf_corners)
                 )
             )
 
-        if bf_yellows_dir.exists():
-
+        if bf_yellows.exists():
             backfill_models.yellows = (
                 LGBMPoissonModel.load(
-                    str(bf_yellows_dir)
+                    str(bf_yellows)
                 )
             )
 
@@ -390,33 +328,25 @@ async def lifespan(app: FastAPI):
             "lgbm-poisson-backfill-20260131"
         )
 
-        log.info(
-            "  Backfill models loaded"
-        )
+        log.info("Backfill models loaded")
 
-    # ───────────────────────────────────────────────────────────────
     # NATIONAL MODEL
-    # ───────────────────────────────────────────────────────────────
-
     try:
 
         nm = national_api.load_national()
 
         log.info(
-            f"  National model loaded "
+            f"National model loaded "
             f"({len(nm.attack)} teams)"
         )
 
     except Exception as e:
 
         log.warning(
-            f"  National model not loaded: {e}"
+            f"National model not loaded: {e}"
         )
 
-    # ───────────────────────────────────────────────────────────────
     # GAGNE TEMPS
-    # ───────────────────────────────────────────────────────────────
-
     try:
 
         features_path = Path(
@@ -426,14 +356,8 @@ async def lifespan(app: FastAPI):
         if not features_path.exists():
 
             raise FileNotFoundError(
-                f"features.csv not found: "
-                f"{features_path}"
+                f"features.csv not found: {features_path}"
             )
-
-        log.info(
-            f"  Loading GAGNE TEMPS data: "
-            f"{features_path}"
-        )
 
         club_predictor = MatchPredictor(
             features_path=str(
@@ -444,9 +368,8 @@ async def lifespan(app: FastAPI):
         club_predictor.load_model()
 
         log.info(
-            f"  GAGNE TEMPS predictor loaded "
-            f"({len(club_predictor.df)} "
-            f"historical matches)"
+            f"GAGNE TEMPS predictor loaded "
+            f"({len(club_predictor.df)} historical matches)"
         )
 
     except Exception as e:
@@ -454,53 +377,33 @@ async def lifespan(app: FastAPI):
         club_predictor = None
 
         log.exception(
-            f"  GAGNE TEMPS predictor "
-            f"failed to load: {e}"
-        )
-
-    # ───────────────────────────────────────────────────────────────
-    # API-FOOTBALL
-    # ───────────────────────────────────────────────────────────────
-
-    if API_FOOTBALL_KEY:
-
-        log.info(
-            "  API-Football integration enabled"
-        )
-
-    else:
-
-        log.warning(
-            "  API-Football integration disabled: "
-            "API_FOOTBALL_KEY is not configured"
+            f"GAGNE TEMPS predictor failed: {e}"
         )
 
     log.info(
-        f"  All models loaded in "
+        f"All models loaded in "
         f"{time.time() - t0:.1f}s"
     )
 
     yield
 
-    log.info(
-        "Shutting down"
-    )
+    log.info("Shutting down")
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # FASTAPI
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 app = FastAPI(
     title="TikaML Prediction Service",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # NATIONAL ROUTES
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 app.include_router(
     national_api.router,
@@ -510,9 +413,9 @@ app.include_router(
 )
 
 
-# ═══════════════════════════════════════════════════════════════════
-# GENERIC FEATURE HELPERS
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
+# GENERIC HELPERS
+# ================================================================
 
 def _build_feature_df(
     feature_vector: dict,
@@ -523,9 +426,7 @@ def _build_feature_df(
 
     for col in feature_list:
 
-        val = feature_vector.get(
-            col
-        )
+        val = feature_vector.get(col)
 
         row[col] = (
             float(val)
@@ -533,49 +434,33 @@ def _build_feature_df(
             else np.nan
         )
 
-    return pd.DataFrame(
-        [row]
-    )
+    return pd.DataFrame([row])
 
 
 def _goals_over_under(
     matrix: np.ndarray,
 ) -> dict:
 
-    ou = {}
+    result = {}
 
-    for line in [
-        1.5,
-        2.5,
-        3.5,
-    ]:
+    for line in [1.5, 2.5, 3.5]:
 
         p_over = sum(
             matrix[i, j]
-
             for i in range(MAX_GOALS)
-
             for j in range(MAX_GOALS)
-
             if i + j > line
         )
 
-        ou[str(line)] = {
-
-            "over":
-                round(
-                    float(p_over),
-                    4,
-                ),
-
-            "under":
-                round(
-                    float(1 - p_over),
-                    4,
-                ),
+        result[str(line)] = {
+            "over": round(float(p_over), 4),
+            "under": round(
+                float(1 - p_over),
+                4,
+            ),
         }
 
-    return ou
+    return result
 
 
 def _poisson_over_under(
@@ -583,7 +468,7 @@ def _poisson_over_under(
     lines: list[float],
 ) -> dict:
 
-    ou = {}
+    result = {}
 
     for line in lines:
 
@@ -595,22 +480,15 @@ def _poisson_over_under(
             )
         )
 
-        ou[str(line)] = {
-
-            "over":
-                round(
-                    p_over,
-                    4,
-                ),
-
-            "under":
-                round(
-                    1 - p_over,
-                    4,
-                ),
+        result[str(line)] = {
+            "over": round(p_over, 4),
+            "under": round(
+                1 - p_over,
+                4,
+            ),
         }
 
-    return ou
+    return result
 
 
 def _live_over_under(
@@ -619,18 +497,15 @@ def _live_over_under(
     lines: list[float],
 ) -> dict:
 
-    ou = {}
+    result = {}
 
     for line in lines:
 
-        needed = (
-            line
-            - current_total
-        )
+        needed = line - current_total
 
         if needed <= 0:
 
-            ou[str(line)] = {
+            result[str(line)] = {
                 "over": 1.0,
                 "under": 0.0,
             }
@@ -645,27 +520,23 @@ def _live_over_under(
                 )
             )
 
-            ou[str(line)] = {
-
-                "over":
-                    round(
-                        p_over,
-                        4,
-                    ),
-
-                "under":
-                    round(
-                        1 - p_over,
-                        4,
-                    ),
+            result[str(line)] = {
+                "over": round(
+                    p_over,
+                    4,
+                ),
+                "under": round(
+                    1 - p_over,
+                    4,
+                ),
             }
 
-    return ou
+    return result
 
 
-# ═══════════════════════════════════════════════════════════════════
-# PREMATCH PREDICTION
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
+# PREMATCH
+# ================================================================
 
 def predict_prematch(
     feature_vector: dict,
@@ -677,35 +548,25 @@ def predict_prematch(
 
     predictions = {}
 
-    # ───────────────────────────────────────────────────────────────
     # GOALS
-    # ───────────────────────────────────────────────────────────────
-
-    if (
-        "goals" in requested_models
-        and m.goals
-    ):
+    if "goals" in requested_models and m.goals:
 
         feat_df = _build_feature_df(
             feature_vector,
             m.goals.feature_cols,
         )
 
-        lh, la = (
-            m.goals.predict_lambdas(
-                feat_df
-            )
+        lh, la = m.goals.predict_lambdas(
+            feat_df
         )
 
         lh = float(lh[0])
         la = float(la[0])
 
-        matrix = (
-            m.goals.predict_score_matrix(
-                lh,
-                la,
-                MAX_GOALS,
-            )
+        matrix = m.goals.predict_score_matrix(
+            lh,
+            la,
+            MAX_GOALS,
         )
 
         p_home = float(
@@ -739,123 +600,81 @@ def predict_prematch(
             p_away /= total
 
         score_matrix = [
-
             [
                 round(
-                    float(
-                        matrix[i, j]
-                    ),
+                    float(matrix[i, j]),
                     4,
                 )
-
-                for j in range(
-                    MAX_GOALS
-                )
+                for j in range(MAX_GOALS)
             ]
-
-            for i in range(
-                MAX_GOALS
-            )
+            for i in range(MAX_GOALS)
         ]
 
         best_i, best_j = divmod(
-            int(
-                np.argmax(matrix)
-            ),
+            int(np.argmax(matrix)),
             MAX_GOALS,
         )
-
-        recommended_score = {
-
-            "home_goals":
-                best_i,
-
-            "away_goals":
-                best_j,
-
-            "prob":
-                round(
-                    float(
-                        matrix[
-                            best_i,
-                            best_j
-                        ]
-                    ),
-                    4,
-                ),
-
-            "label":
-                f"{best_i}-{best_j}",
-        }
 
         predictions["goals"] = {
 
             "home_win":
-                round(
-                    p_home,
-                    4,
-                ),
+                round(p_home, 4),
 
             "draw":
-                round(
-                    p_draw,
-                    4,
-                ),
+                round(p_draw, 4),
 
             "away_win":
-                round(
-                    p_away,
-                    4,
-                ),
+                round(p_away, 4),
 
             "expected_home":
-                round(
-                    lh,
-                    4,
-                ),
+                round(lh, 4),
 
             "expected_away":
-                round(
-                    la,
-                    4,
-                ),
+                round(la, 4),
 
             "predicted_total":
-                round(
-                    lh + la,
-                    4,
-                ),
+                round(lh + la, 4),
 
             "over_under":
-                _goals_over_under(
-                    matrix
-                ),
+                _goals_over_under(matrix),
 
             "score_matrix":
                 score_matrix,
 
-            "recommended_score":
-                recommended_score,
+            "recommended_score": {
+
+                "home_goals":
+                    best_i,
+
+                "away_goals":
+                    best_j,
+
+                "prob":
+                    round(
+                        float(
+                            matrix[
+                                best_i,
+                                best_j
+                            ]
+                        ),
+                        4,
+                    ),
+
+                "label":
+                    f"{best_i}-{best_j}",
+            },
         }
 
-    # ───────────────────────────────────────────────────────────────
     # CORNERS
-    # ───────────────────────────────────────────────────────────────
-
-    if (
-        "corners" in requested_models
-        and m.corners
-    ):
+    if "corners" in requested_models and m.corners:
 
         feat_df = _build_feature_df(
             feature_vector,
             m.corners.feature_cols,
         )
 
-        clh, cla = (
-            m.corners.predict_lambdas(
-                feat_df
-            )
+        clh, cla = m.corners.predict_lambdas(
+            feat_df
         )
 
         clh = float(clh[0])
@@ -864,22 +683,13 @@ def predict_prematch(
         predictions["corners"] = {
 
             "expected_home":
-                round(
-                    clh,
-                    4,
-                ),
+                round(clh, 4),
 
             "expected_away":
-                round(
-                    cla,
-                    4,
-                ),
+                round(cla, 4),
 
             "predicted_total":
-                round(
-                    clh + cla,
-                    4,
-                ),
+                round(clh + cla, 4),
 
             "over_under":
                 _poisson_over_under(
@@ -893,24 +703,16 @@ def predict_prematch(
                 ),
         }
 
-    # ───────────────────────────────────────────────────────────────
     # YELLOWS
-    # ───────────────────────────────────────────────────────────────
-
-    if (
-        "yellows" in requested_models
-        and m.yellows
-    ):
+    if "yellows" in requested_models and m.yellows:
 
         feat_df = _build_feature_df(
             feature_vector,
             m.yellows.feature_cols,
         )
 
-        ylh, yla = (
-            m.yellows.predict_lambdas(
-                feat_df
-            )
+        ylh, yla = m.yellows.predict_lambdas(
+            feat_df
         )
 
         ylh = float(ylh[0])
@@ -919,22 +721,13 @@ def predict_prematch(
         predictions["yellows"] = {
 
             "expected_home":
-                round(
-                    ylh,
-                    4,
-                ),
+                round(ylh, 4),
 
             "expected_away":
-                round(
-                    yla,
-                    4,
-                ),
+                round(yla, 4),
 
             "predicted_total":
-                round(
-                    ylh + yla,
-                    4,
-                ),
+                round(ylh + yla, 4),
 
             "over_under":
                 _poisson_over_under(
@@ -951,9 +744,9 @@ def predict_prematch(
     return predictions
 
 
-# ═══════════════════════════════════════════════════════════════════
-# LIVE PREDICTION
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
+# LIVE
+# ================================================================
 
 def predict_live(
     feature_vector: dict,
@@ -968,24 +761,15 @@ def predict_live(
 
     minute = ctx.minute or 0
 
-    # ───────────────────────────────────────────────────────────────
-    # LIVE GOALS
-    # ───────────────────────────────────────────────────────────────
-
-    if (
-        "goals" in requested_models
-        and m.goals
-    ):
+    if "goals" in requested_models and m.goals:
 
         feat_df = _build_feature_df(
             feature_vector,
             m.goals.feature_cols,
         )
 
-        lh, la = (
-            m.goals.predict_lambdas(
-                feat_df
-            )
+        lh, la = m.goals.predict_lambdas(
+            feat_df
         )
 
         lh = float(lh[0])
@@ -1011,25 +795,15 @@ def predict_live(
         rem = live["remaining_matrix"]
 
         matrix = np.zeros(
-            (
-                MAX_GOALS,
-                MAX_GOALS,
-            )
+            (MAX_GOALS, MAX_GOALS)
         )
 
         for i in range(MAX_GOALS):
 
             for j in range(MAX_GOALS):
 
-                ri = (
-                    i
-                    - ctx.home_score
-                )
-
-                rj = (
-                    j
-                    - ctx.away_score
-                )
+                ri = i - ctx.home_score
+                rj = j - ctx.away_score
 
                 if (
                     0 <= ri < MAX_GOALS
@@ -1037,72 +811,22 @@ def predict_live(
                     0 <= rj < MAX_GOALS
                 ):
 
-                    matrix[i, j] = (
-                        rem[ri, rj]
-                    )
+                    matrix[i, j] = rem[ri, rj]
 
         if matrix.sum() > 0:
-
             matrix /= matrix.sum()
 
-        score_matrix = [
-
-            [
-                round(
-                    float(
-                        matrix[i, j]
-                    ),
-                    4,
-                )
-
-                for j in range(
-                    MAX_GOALS
-                )
-            ]
-
-            for i in range(
-                MAX_GOALS
-            )
-        ]
-
         best_i, best_j = divmod(
-            int(
-                np.argmax(matrix)
-            ),
+            int(np.argmax(matrix)),
             MAX_GOALS,
         )
-
-        recommended_score = {
-
-            "home_goals":
-                best_i,
-
-            "away_goals":
-                best_j,
-
-            "prob":
-                round(
-                    float(
-                        matrix[
-                            best_i,
-                            best_j
-                        ]
-                    ),
-                    4,
-                ),
-
-            "label":
-                f"{best_i}-{best_j}",
-        }
 
         predictions["goals"] = {
 
             "home_win":
                 round(
                     float(
-                        live[
-                            "probs_1x2"
-                        ][0]
+                        live["probs_1x2"][0]
                     ),
                     4,
                 ),
@@ -1110,9 +834,7 @@ def predict_live(
             "draw":
                 round(
                     float(
-                        live[
-                            "probs_1x2"
-                        ][1]
+                        live["probs_1x2"][1]
                     ),
                     4,
                 ),
@@ -1120,48 +842,31 @@ def predict_live(
             "away_win":
                 round(
                     float(
-                        live[
-                            "probs_1x2"
-                        ][2]
+                        live["probs_1x2"][2]
                     ),
                     4,
                 ),
 
             "expected_home":
-                round(
-                    lh,
-                    4,
-                ),
+                round(lh, 4),
 
             "expected_away":
-                round(
-                    la,
-                    4,
-                ),
+                round(la, 4),
 
             "predicted_total":
-                round(
-                    lh + la,
-                    4,
-                ),
+                round(lh + la, 4),
 
             "over_under": {
-
                 str(k): {
-
-                    "over":
-                        round(
-                            v["over"],
-                            4,
-                        ),
-
-                    "under":
-                        round(
-                            v["under"],
-                            4,
-                        ),
+                    "over": round(
+                        v["over"],
+                        4,
+                    ),
+                    "under": round(
+                        v["under"],
+                        4,
+                    ),
                 }
-
                 for k, v in live[
                     "over_under"
                 ].items()
@@ -1188,48 +893,53 @@ def predict_live(
                 ),
 
             "next_goal": {
-
-                k:
-                    round(
-                        float(v),
-                        4,
-                    )
-
+                k: round(
+                    float(v),
+                    4,
+                )
                 for k, v in live[
                     "next_goal"
                 ].items()
             },
 
-            "score_matrix":
-                score_matrix,
+            "recommended_score": {
 
-            "recommended_score":
-                recommended_score,
+                "home_goals":
+                    best_i,
+
+                "away_goals":
+                    best_j,
+
+                "prob":
+                    round(
+                        float(
+                            matrix[
+                                best_i,
+                                best_j
+                            ]
+                        ),
+                        4,
+                    ),
+
+                "label":
+                    f"{best_i}-{best_j}",
+            },
         }
-
-    # ───────────────────────────────────────────────────────────────
-    # LIVE CORNERS / CARDS
-    # ───────────────────────────────────────────────────────────────
 
     r = max(
         0,
         (90 - minute) / 90,
     )
 
-    if (
-        "corners" in requested_models
-        and m.corners
-    ):
+    if "corners" in requested_models and m.corners:
 
         feat_df = _build_feature_df(
             feature_vector,
             m.corners.feature_cols,
         )
 
-        clh, cla = (
-            m.corners.predict_lambdas(
-                feat_df
-            )
+        clh, cla = m.corners.predict_lambdas(
+            feat_df
         )
 
         clh = float(clh[0])
@@ -1238,42 +948,25 @@ def predict_live(
         predictions["corners"] = {
 
             "expected_home":
-                round(
-                    clh,
-                    4,
-                ),
+                round(clh, 4),
 
             "expected_away":
-                round(
-                    cla,
-                    4,
-                ),
+                round(cla, 4),
 
             "predicted_total":
-                round(
-                    clh + cla,
-                    4,
-                ),
+                round(clh + cla, 4),
 
             "lambda_remaining_home":
-                round(
-                    clh * r,
-                    4,
-                ),
+                round(clh * r, 4),
 
             "lambda_remaining_away":
-                round(
-                    cla * r,
-                    4,
-                ),
+                round(cla * r, 4),
 
             "over_under":
                 _live_over_under(
                     (clh + cla) * r,
-                    (
-                        ctx.home_corners
-                        + ctx.away_corners
-                    ),
+                    ctx.home_corners
+                    + ctx.away_corners,
                     [
                         8.5,
                         9.5,
@@ -1283,20 +976,15 @@ def predict_live(
                 ),
         }
 
-    if (
-        "yellows" in requested_models
-        and m.yellows
-    ):
+    if "yellows" in requested_models and m.yellows:
 
         feat_df = _build_feature_df(
             feature_vector,
             m.yellows.feature_cols,
         )
 
-        ylh, yla = (
-            m.yellows.predict_lambdas(
-                feat_df
-            )
+        ylh, yla = m.yellows.predict_lambdas(
+            feat_df
         )
 
         ylh = float(ylh[0])
@@ -1305,42 +993,25 @@ def predict_live(
         predictions["yellows"] = {
 
             "expected_home":
-                round(
-                    ylh,
-                    4,
-                ),
+                round(ylh, 4),
 
             "expected_away":
-                round(
-                    yla,
-                    4,
-                ),
+                round(yla, 4),
 
             "predicted_total":
-                round(
-                    ylh + yla,
-                    4,
-                ),
+                round(ylh + yla, 4),
 
             "lambda_remaining_home":
-                round(
-                    ylh * r,
-                    4,
-                ),
+                round(ylh * r, 4),
 
             "lambda_remaining_away":
-                round(
-                    yla * r,
-                    4,
-                ),
+                round(yla * r, 4),
 
             "over_under":
                 _live_over_under(
                     (ylh + yla) * r,
-                    (
-                        ctx.home_yellows
-                        + ctx.away_yellows
-                    ),
+                    ctx.home_yellows
+                    + ctx.away_yellows,
                     [
                         2.5,
                         3.5,
@@ -1353,13 +1024,11 @@ def predict_live(
     return predictions
 
 
-# ═══════════════════════════════════════════════════════════════════
-# TEAM NAME NORMALIZATION
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
+# TEAM NORMALIZATION
+# ================================================================
 
-def _normalize_team_name(
-    name: str,
-) -> str:
+def _normalize_team_name(name: str) -> str:
 
     if not name:
         return ""
@@ -1396,75 +1065,134 @@ def _normalize_team_name(
 TEAM_ALIASES = {
 
     "fc schalke 04":
-        "Schalke 04",
-
-    "schalke 04":
-        "Schalke 04",
+        [
+            "Schalke 04",
+            "FC Schalke 04",
+        ],
 
     "inter milan":
-        "Inter",
+        [
+            "Inter",
+            "Internazionale",
+            "Inter Milan",
+        ],
 
     "internazionale":
-        "Inter",
-
-    "fc internazionale milano":
-        "Inter",
+        [
+            "Inter",
+            "Internazionale",
+        ],
 
     "psg":
-        "Paris Saint-Germain",
+        [
+            "Paris Saint-Germain",
+            "Paris Saint-Germain FC",
+        ],
 
     "paris saint germain":
-        "Paris Saint-Germain",
+        [
+            "Paris Saint-Germain",
+            "Paris Saint-Germain FC",
+        ],
 
-    "paris saint-germain":
-        "Paris Saint-Germain",
+    "paris saint germain fc":
+        [
+            "Paris Saint-Germain",
+            "Paris Saint-Germain FC",
+        ],
 
     "man united":
-        "Manchester United",
+        [
+            "Manchester United",
+        ],
 
     "manchester united":
-        "Manchester United",
+        [
+            "Manchester United",
+        ],
 
     "man city":
-        "Manchester City",
-
-    "manchester city":
-        "Manchester City",
+        [
+            "Manchester City",
+        ],
 
     "athletic bilbao":
-        "Athletic Club",
-
-    "athletic club":
-        "Athletic Club",
-
-    "club atletico de madrid":
-        "Atletico Madrid",
+        [
+            "Athletic Club",
+            "Athletic Bilbao",
+        ],
 
     "atletico madrid":
-        "Atletico Madrid",
-
-    "real betis balompie":
-        "Real Betis",
+        [
+            "Atletico Madrid",
+            "Club Atletico de Madrid",
+        ],
 
     "real betis":
-        "Real Betis",
-
-    "sporting de gijon":
-        "Sporting Gijon",
+        [
+            "Real Betis",
+            "Real Betis Balompie",
+        ],
 
     "sporting gijon":
-        "Sporting Gijon",
+        [
+            "Sporting Gijon",
+            "Sporting de Gijon",
+        ],
 
-    "paris fc":
-        "Paris FC",
+    "rennes":
+        [
+            "Rennes",
+            "Stade Rennais",
+            "Stade Rennais FC 1901",
+        ],
+
+    "stade rennais":
+        [
+            "Rennes",
+            "Stade Rennais",
+            "Stade Rennais FC 1901",
+        ],
+
+    "marseille":
+        [
+            "Marseille",
+            "Olympique de Marseille",
+        ],
+
+    "olympique de marseille":
+        [
+            "Marseille",
+            "Olympique de Marseille",
+        ],
+
+    "sevilla":
+        [
+            "Sevilla",
+            "Sevilla FC",
+        ],
+
+    "valencia":
+        [
+            "Valencia",
+            "Valencia CF",
+        ],
+
+    "venezia":
+        [
+            "Venezia",
+            "Venezia FC",
+        ],
+
+    "fiorentina":
+        [
+            "Fiorentina",
+            "ACF Fiorentina",
+        ],
 }
 
 
 def _build_team_index():
-
-    """
-    Build normalized index from features.csv.
-    """
 
     if club_predictor is None:
         return {}
@@ -1473,32 +1201,26 @@ def _build_team_index():
 
     teams = set()
 
-    if "home_team" in df.columns:
+    for column in [
+        "home_team",
+        "away_team",
+    ]:
 
-        teams.update(
-            df["home_team"]
-            .dropna()
-            .astype(str)
-            .tolist()
-        )
+        if column in df.columns:
 
-    if "away_team" in df.columns:
-
-        teams.update(
-            df["away_team"]
-            .dropna()
-            .astype(str)
-            .tolist()
-        )
+            teams.update(
+                df[column]
+                .dropna()
+                .astype(str)
+                .tolist()
+            )
 
     index = {}
 
     for team in teams:
 
-        normalized = (
-            _normalize_team_name(
-                team
-            )
+        normalized = _normalize_team_name(
+            team
         )
 
         if normalized:
@@ -1516,203 +1238,109 @@ def _match_dataset_team(
     team_index: dict,
 ):
 
-    """
-    Find exact TikaML dataset team.
-    """
-
     if not api_team_name:
         return None
 
-    normalized = (
-        _normalize_team_name(
-            api_team_name
-        )
+    normalized = _normalize_team_name(
+        api_team_name
     )
 
-    # 1. Exact match
+    # Exact
     if normalized in team_index:
+        return team_index[normalized]
 
-        return team_index[
-            normalized
-        ]
+    # Alias
+    for candidate in TEAM_ALIASES.get(
+        normalized,
+        [],
+    ):
 
-    # 2. Explicit alias
-    alias = TEAM_ALIASES.get(
-        normalized
-    )
-
-    if alias:
-
-        alias_norm = (
+        candidate_norm = (
             _normalize_team_name(
-                alias
+                candidate
             )
         )
 
-        if alias_norm in team_index:
+        if candidate_norm in team_index:
 
             return team_index[
-                alias_norm
+                candidate_norm
             ]
 
-    # 3. Legacy aliases
-    aliases = {
-
-        "inter milan": [
-            "Inter",
-            "Internazionale",
-            "Inter Milan",
-        ],
-
-        "internazionale": [
-            "Inter",
-            "Internazionale",
-        ],
-
-        "inter": [
-            "Inter",
-            "Internazionale",
-        ],
-
-        "psg": [
-            "Paris Saint-Germain",
-            "Paris Saint Germain",
-        ],
-
-        "paris saint germain": [
-            "Paris Saint-Germain",
-            "Paris Saint Germain",
-        ],
-
-        "paris saint germain fc": [
-            "Paris Saint-Germain",
-            "Paris Saint Germain",
-        ],
-
-        "fc schalke 04": [
-            "Schalke 04",
-            "FC Schalke 04",
-        ],
-    }
-
-    if normalized in aliases:
-
-        for candidate in aliases[
-            normalized
-        ]:
-
-            candidate_norm = (
-                _normalize_team_name(
-                    candidate
-                )
-            )
-
-            if candidate_norm in team_index:
-
-                return team_index[
-                    candidate_norm
-                ]
-
-    # 4. Conservative token matching
+    # Conservative matching
     tokens = set(
         normalized.split()
     )
 
-    if tokens:
+    if not tokens:
+        return None
 
-        candidates = []
+    candidates = []
 
-        for (
-            team_norm,
-            team_name,
-        ) in team_index.items():
+    for (
+        team_norm,
+        team_name,
+    ) in team_index.items():
 
-            team_tokens = set(
-                team_norm.split()
+        team_tokens = set(
+            team_norm.split()
+        )
+
+        intersection = (
+            tokens & team_tokens
+        )
+
+        if (
+            len(intersection) >= 2
+            and (
+                tokens <= team_tokens
+                or
+                team_tokens <= tokens
             )
+        ):
 
-            intersection = (
-                tokens
-                & team_tokens
-            )
-
-            if (
-                len(intersection) >= 2
-                and (
-                    tokens <= team_tokens
-                    or
-                    team_tokens <= tokens
+            candidates.append(
+                (
+                    len(intersection),
+                    team_name,
                 )
-            ):
-
-                candidates.append(
-                    (
-                        len(intersection),
-                        team_name,
-                    )
-                )
-
-        if candidates:
-
-            candidates.sort(
-                reverse=True
             )
 
-            return candidates[0][1]
+    if candidates:
+
+        candidates.sort(
+            key=lambda x: (
+                x[0],
+                len(x[1]),
+            ),
+            reverse=True,
+        )
+
+        return candidates[0][1]
 
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════
-# API-FOOTBALL GENERIC REQUEST
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
+# OPENFOOTBALL HTTP
+# ================================================================
 
-def _api_football_get(
-    endpoint: str,
-    params: dict | None = None,
+def _download_openfootball(
+    season_folder: str,
+    filename: str,
 ):
-    """
-    Generic API-Football GET helper.
-    """
-
-    if not API_FOOTBALL_KEY:
-
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "API_FOOTBALL_KEY is not configured."
-            ),
-        )
-
-    params = params or {}
-
-    query = urlencode(
-        {
-            k: v
-            for k, v in params.items()
-            if v is not None
-        }
-    )
 
     url = (
-        f"{API_FOOTBALL_URL}"
-        f"{endpoint}"
+        f"{OPENFOOTBALL_BASE_URL}/"
+        f"{season_folder}/"
+        f"{filename}"
     )
-
-    if query:
-        url += f"?{query}"
 
     request = Request(
         url,
         headers={
-            "x-apisports-key":
-                API_FOOTBALL_KEY,
-
-            "Accept":
-                "application/json",
-
-            "User-Agent":
-                "GAGNE-TEMPS/2.0",
+            "Accept": "application/json",
+            "User-Agent": "GAGNE-TEMPS/3.0",
         },
         method="GET",
     )
@@ -1726,168 +1354,68 @@ def _api_football_get(
 
             raw = response.read()
 
-        data = json.loads(
-            raw.decode(
-                "utf-8"
-            )
+        return json.loads(
+            raw.decode("utf-8")
         )
 
     except HTTPError as e:
 
-        log.error(
-            f"API-Football HTTP "
-            f"{e.code} on {endpoint}"
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"API-Football HTTP "
-                f"{e.code}"
-            ),
+        raise RuntimeError(
+            f"OpenFootball HTTP {e.code}: {url}"
         )
 
     except URLError as e:
 
-        log.error(
-            f"API-Football connection "
-            f"error on {endpoint}: {e}"
+        raise RuntimeError(
+            f"OpenFootball connection error: {e}"
         )
 
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Unable to connect to "
-                "API-Football."
-            ),
+    except json.JSONDecodeError as e:
+
+        raise RuntimeError(
+            f"Invalid OpenFootball JSON: {e}"
         )
 
-    except Exception as e:
 
-        log.exception(
-            f"API-Football parsing error "
-            f"on {endpoint}"
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"API-Football error: {e}"
-            ),
-        )
-
-    if data.get("errors"):
-
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message":
-                    "API-Football returned an error.",
-
-                "errors":
-                    data.get("errors"),
-            },
-        )
-
-    return data.get(
-        "response",
-        [],
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════
-# FIXTURES
-# ═══════════════════════════════════════════════════════════════════
-
-def _fetch_api_football_fixtures(
-    fixture_date: str,
+def _get_openfootball_dataset(
+    tika_code: str,
+    season: str,
 ):
 
-    return _api_football_get(
-        "/fixtures",
-        {
-            "date":
-                fixture_date,
-        },
+    league = SUPPORTED_LEAGUES.get(
+        tika_code
     )
 
+    if not league:
 
-def _get_today_fixture_date():
-
-    """
-    Mali is UTC+0.
-    """
-
-    return datetime.now(
-        timezone.utc
-    ).strftime(
-        "%Y-%m-%d"
-    )
-
-
-def _get_cached_fixtures(
-    fixture_date: str,
-):
-
-    now = time.time()
-
-    if (
-        FIXTURE_CACHE["date"]
-        == fixture_date
-
-        and
-        FIXTURE_CACHE["fixtures"]
-        is not None
-
-        and
-        (
-            now
-            - FIXTURE_CACHE["timestamp"]
+        raise ValueError(
+            f"Unsupported league: {tika_code}"
         )
-        < FIXTURE_CACHE_SECONDS
-    ):
 
-        return FIXTURE_CACHE[
-            "fixtures"
-        ]
+    # TikaML usually uses 2026.
+    # OpenFootball uses 2026-27.
+    try:
 
-    fixtures = (
-        _fetch_api_football_fixtures(
-            fixture_date
+        year = int(
+            str(season)[:4]
         )
-    )
 
-    FIXTURE_CACHE[
-        "date"
-    ] = fixture_date
+    except Exception:
 
-    FIXTURE_CACHE[
-        "timestamp"
-    ] = now
+        year = datetime.now(
+            timezone.utc
+        ).year
 
-    FIXTURE_CACHE[
-        "fixtures"
-    ] = fixtures
-
-    return fixtures
-
-
-# ═══════════════════════════════════════════════════════════════════
-# CURRENT STANDINGS
-# ═══════════════════════════════════════════════════════════════════
-
-def _get_current_standings(
-    league_id: int,
-    season: int,
-):
+    season_folder = f"{year}-{str(year + 1)[-2:]}"
 
     cache_key = (
-        f"{league_id}:{season}"
+        f"{season_folder}:"
+        f"{league['file']}"
     )
 
-    cached = DATA_CACHE[
-        "standings"
-    ].get(cache_key)
+    cached = OPENFOOTBALL_CACHE.get(
+        cache_key
+    )
 
     now = time.time()
 
@@ -1896,24 +1424,18 @@ def _get_current_standings(
         if (
             now
             - cached["timestamp"]
-        ) < STANDINGS_CACHE_SECONDS:
+        ) < OPENFOOTBALL_CACHE_SECONDS:
 
             return cached["data"]
 
-    data = _api_football_get(
-        "/standings",
-        {
-            "league":
-                league_id,
-
-            "season":
-                season,
-        },
+    data = _download_openfootball(
+        season_folder,
+        league["file"],
     )
 
-    DATA_CACHE[
-        "standings"
-    ][cache_key] = {
+    OPENFOOTBALL_CACHE[
+        cache_key
+    ] = {
 
         "timestamp":
             now,
@@ -1922,168 +1444,631 @@ def _get_current_standings(
             data,
     }
 
+    log.info(
+        f"OpenFootball loaded: "
+        f"{season_folder}/{league['file']} "
+        f"({len(data.get('matches', []))} matches)"
+    )
+
     return data
 
 
-def _extract_team_standing(
-    standings_response,
-    team_id: int | None,
-    team_name: str | None = None,
-):
+# ================================================================
+# OPENFOOTBALL MATCH HELPERS
+# ================================================================
 
-    if not standings_response:
+def _extract_score(match):
+
+    score = match.get(
+        "score"
+    )
+
+    if not score:
+        return None
+
+    if isinstance(
+        score,
+        list,
+    ):
+
+        if len(score) >= 2:
+            return (
+                int(score[0]),
+                int(score[1]),
+            )
 
         return None
 
-    normalized_name = (
-        _normalize_team_name(
-            team_name or ""
-        )
-    )
+    if isinstance(
+        score,
+        dict,
+    ):
 
-    for block in standings_response:
-
-        league = block.get(
-            "league",
-            {}
+        ft = score.get(
+            "ft"
         )
 
-        standings_groups = (
-            league.get(
-                "standings",
-                []
-            )
-        )
+        if (
+            isinstance(ft, list)
+            and len(ft) >= 2
+        ):
 
-        for group in standings_groups:
+            try:
 
-            for row in group:
-
-                team = row.get(
-                    "team",
-                    {}
+                return (
+                    int(ft[0]),
+                    int(ft[1]),
                 )
 
-                api_id = team.get(
-                    "id"
-                )
+            except (
+                TypeError,
+                ValueError,
+            ):
 
-                api_name = team.get(
-                    "name",
-                    ""
-                )
-
-                if (
-                    team_id is not None
-                    and
-                    api_id == team_id
-                ):
-
-                    return row
-
-                if (
-                    normalized_name
-                    and
-                    _normalize_team_name(
-                        api_name
-                    )
-                    == normalized_name
-                ):
-
-                    return row
+                return None
 
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════
-# H2H
-# ═══════════════════════════════════════════════════════════════════
+def _match_is_finished(match):
 
-def _get_h2h(
-    home_id: int,
-    away_id: int,
-):
-
-    cache_key = (
-        f"{home_id}-{away_id}"
+    return (
+        _extract_score(match)
+        is not None
     )
 
-    cached = DATA_CACHE[
-        "h2h"
-    ].get(cache_key)
 
-    now = time.time()
+def _openfootball_team_matches(
+    matches,
+    team_name,
+    before_date=None,
+):
 
-    if cached:
+    normalized = _normalize_team_name(
+        team_name
+    )
+
+    result = []
+
+    for match in matches:
+
+        team1 = match.get(
+            "team1",
+            ""
+        )
+
+        team2 = match.get(
+            "team2",
+            ""
+        )
+
+        n1 = _normalize_team_name(
+            team1
+        )
+
+        n2 = _normalize_team_name(
+            team2
+        )
 
         if (
-            now
-            - cached["timestamp"]
-        ) < H2H_CACHE_SECONDS:
+            normalized != n1
+            and
+            normalized != n2
+        ):
 
-            return cached["data"]
+            continue
 
-    data = _api_football_get(
-        "/fixtures/headtohead",
-        {
-            "h2h":
-                f"{home_id}-{away_id}",
+        date = match.get(
+            "date"
+        )
 
-            "last":
-                10,
-        },
+        if not date:
+            continue
+
+        if before_date and date >= before_date:
+            continue
+
+        if not _match_is_finished(match):
+            continue
+
+        result.append(match)
+
+    result.sort(
+        key=lambda x:
+            x.get("date", ""),
+        reverse=True,
     )
 
-    DATA_CACHE[
-        "h2h"
-    ][cache_key] = {
-
-        "timestamp":
-            now,
-
-        "data":
-            data,
-    }
-
-    return data
+    return result
 
 
-def _summarize_h2h(
-    fixtures,
-    home_id: int,
+# ================================================================
+# CURRENT STANDINGS FROM OPENFOOTBALL
+# ================================================================
+
+def _calculate_standings(
+    matches,
+    before_date=None,
 ):
 
-    if not fixtures:
+    table = {}
 
-        return {
+    for match in matches:
 
-            "matches":
-                0,
+        date = match.get(
+            "date"
+        )
 
-            "home_wins":
-                0,
+        if not date:
+            continue
 
-            "draws":
-                0,
+        if before_date and date >= before_date:
+            continue
 
-            "away_wins":
-                0,
+        score = _extract_score(
+            match
+        )
 
-            "home_goals":
-                0,
+        if score is None:
+            continue
 
-            "away_goals":
-                0,
+        team1 = match.get(
+            "team1"
+        )
 
-            "home_win_pct":
-                None,
+        team2 = match.get(
+            "team2"
+        )
 
-            "draw_pct":
-                None,
+        if not team1 or not team2:
+            continue
 
-            "away_win_pct":
-                None,
-        }
+        g1, g2 = score
+
+        for team in [
+            team1,
+            team2,
+        ]:
+
+            if team not in table:
+
+                table[team] = {
+
+                    "team":
+                        team,
+
+                    "played":
+                        0,
+
+                    "wins":
+                        0,
+
+                    "draws":
+                        0,
+
+                    "losses":
+                        0,
+
+                    "goals_for":
+                        0,
+
+                    "goals_against":
+                        0,
+
+                    "points":
+                        0,
+
+                    "home_played":
+                        0,
+
+                    "home_wins":
+                        0,
+
+                    "home_draws":
+                        0,
+
+                    "home_losses":
+                        0,
+
+                    "home_goals_for":
+                        0,
+
+                    "home_goals_against":
+                        0,
+
+                    "away_played":
+                        0,
+
+                    "away_wins":
+                        0,
+
+                    "away_draws":
+                        0,
+
+                    "away_losses":
+                        0,
+
+                    "away_goals_for":
+                        0,
+
+                    "away_goals_against":
+                        0,
+                }
+
+        h = table[team1]
+        a = table[team2]
+
+        h["played"] += 1
+        a["played"] += 1
+
+        h["goals_for"] += g1
+        h["goals_against"] += g2
+
+        a["goals_for"] += g2
+        a["goals_against"] += g1
+
+        h["home_played"] += 1
+        h["home_goals_for"] += g1
+        h["home_goals_against"] += g2
+
+        a["away_played"] += 1
+        a["away_goals_for"] += g2
+        a["away_goals_against"] += g1
+
+        if g1 > g2:
+
+            h["wins"] += 1
+            h["points"] += 3
+
+            a["losses"] += 1
+
+            h["home_wins"] += 1
+            a["away_losses"] += 1
+
+        elif g1 < g2:
+
+            a["wins"] += 1
+            a["points"] += 3
+
+            h["losses"] += 1
+
+            a["away_wins"] += 1
+            h["home_losses"] += 1
+
+        else:
+
+            h["draws"] += 1
+            a["draws"] += 1
+
+            h["points"] += 1
+            a["points"] += 1
+
+            h["home_draws"] += 1
+            a["away_draws"] += 1
+
+    rows = list(
+        table.values()
+    )
+
+    rows.sort(
+        key=lambda x: (
+            x["points"],
+            x["goals_for"]
+            - x["goals_against"],
+            x["goals_for"],
+        ),
+        reverse=True,
+    )
+
+    for rank, row in enumerate(
+        rows,
+        start=1,
+    ):
+
+        row["rank"] = rank
+
+        played = row["played"]
+
+        row["goals_diff"] = (
+            row["goals_for"]
+            - row["goals_against"]
+        )
+
+        row["ppg"] = (
+            round(
+                row["points"]
+                / played,
+                3,
+            )
+            if played
+            else 0
+        )
+
+    return rows
+
+
+def _find_standing(
+    standings,
+    team_name,
+):
+
+    target = _normalize_team_name(
+        team_name
+    )
+
+    for row in standings:
+
+        if (
+            _normalize_team_name(
+                row["team"]
+            )
+            == target
+        ):
+
+            return row
+
+    return None
+
+
+# ================================================================
+# FORM
+# ================================================================
+
+def _calculate_form(
+    matches,
+    team_name,
+    before_date=None,
+    limit=5,
+):
+
+    target = _normalize_team_name(
+        team_name
+    )
+
+    matches = []
+
+    for match in matches:
+
+        date = match.get(
+            "date"
+        )
+
+        if not date:
+            continue
+
+        if before_date and date >= before_date:
+            continue
+
+        score = _extract_score(
+            match
+        )
+
+        if score is None:
+            continue
+
+        team1 = match.get(
+            "team1",
+            ""
+        )
+
+        team2 = match.get(
+            "team2",
+            ""
+        )
+
+        n1 = _normalize_team_name(
+            team1
+        )
+
+        n2 = _normalize_team_name(
+            team2
+        )
+
+        if (
+            target != n1
+            and
+            target != n2
+        ):
+            continue
+
+        matches.append(match)
+
+    matches.sort(
+        key=lambda x:
+            x.get("date", ""),
+        reverse=True,
+    )
+
+    matches = matches[:limit]
+
+    results = []
+
+    for match in matches:
+
+        g1, g2 = _extract_score(
+            match
+        )
+
+        team1 = match.get(
+            "team1",
+            ""
+        )
+
+        is_home = (
+            _normalize_team_name(
+                team1
+            )
+            == target
+        )
+
+        gf, ga = (
+            (g1, g2)
+            if is_home
+            else
+            (g2, g1)
+        )
+
+        if gf > ga:
+            result = "W"
+            points = 3
+
+        elif gf == ga:
+            result = "D"
+            points = 1
+
+        else:
+            result = "L"
+            points = 0
+
+        results.append({
+
+            "date":
+                match.get(
+                    "date"
+                ),
+
+            "opponent":
+                (
+                    match.get(
+                        "team2"
+                    )
+                    if is_home
+                    else
+                    match.get(
+                        "team1"
+                    )
+                ),
+
+            "venue":
+                "home"
+                if is_home
+                else
+                "away",
+
+            "result":
+                result,
+
+            "points":
+                points,
+
+            "goals_for":
+                gf,
+
+            "goals_against":
+                ga,
+        })
+
+    form_string = "".join(
+        x["result"]
+        for x in reversed(results)
+    )
+
+    points = sum(
+        x["points"]
+        for x in results
+    )
+
+    return {
+
+        "string":
+            form_string,
+
+        "last5":
+            results,
+
+        "points":
+            points,
+
+        "ppg":
+            round(
+                points / len(results),
+                3,
+            )
+            if results
+            else 0,
+    }
+
+
+# ================================================================
+# H2H FROM OPENFOOTBALL
+# ================================================================
+
+def _calculate_h2h(
+    matches,
+    home_team,
+    away_team,
+    before_date=None,
+    limit=10,
+):
+
+    home_norm = _normalize_team_name(
+        home_team
+    )
+
+    away_norm = _normalize_team_name(
+        away_team
+    )
+
+    h2h = []
+
+    for match in matches:
+
+        date = match.get(
+            "date"
+        )
+
+        if not date:
+            continue
+
+        if before_date and date >= before_date:
+            continue
+
+        score = _extract_score(
+            match
+        )
+
+        if score is None:
+            continue
+
+        t1 = _normalize_team_name(
+            match.get(
+                "team1",
+                ""
+            )
+        )
+
+        t2 = _normalize_team_name(
+            match.get(
+                "team2",
+                ""
+            )
+        )
+
+        if not (
+            (
+                t1 == home_norm
+                and
+                t2 == away_norm
+            )
+            or
+            (
+                t1 == away_norm
+                and
+                t2 == home_norm
+            )
+        ):
+
+            continue
+
+        h2h.append(match)
+
+    h2h.sort(
+        key=lambda x:
+            x.get("date", ""),
+        reverse=True,
+    )
+
+    h2h = h2h[:limit]
 
     home_wins = 0
     draws = 0
@@ -2092,90 +2077,68 @@ def _summarize_h2h(
     home_goals = 0
     away_goals = 0
 
-    for fixture in fixtures:
+    history = []
 
-        teams = fixture.get(
-            "teams",
-            {}
+    for match in h2h:
+
+        g1, g2 = _extract_score(
+            match
         )
 
-        goals = fixture.get(
-            "goals",
-            {}
-        )
-
-        h_team_id = (
-            teams.get(
-                "home",
-                {}
-            ).get(
-                "id"
+        t1 = _normalize_team_name(
+            match.get(
+                "team1",
+                ""
             )
         )
 
-        h_goals = goals.get(
-            "home"
-        )
+        if t1 == home_norm:
 
-        a_goals = goals.get(
-            "away"
-        )
-
-        if (
-            h_goals is None
-            or
-            a_goals is None
-        ):
-
-            continue
-
-        h_goals = int(
-            h_goals
-        )
-
-        a_goals = int(
-            a_goals
-        )
-
-        if h_team_id == home_id:
-
-            home_goals += h_goals
-            away_goals += a_goals
-
-            if h_goals > a_goals:
-
-                home_wins += 1
-
-            elif h_goals == a_goals:
-
-                draws += 1
-
-            else:
-
-                away_wins += 1
+            hg = g1
+            ag = g2
 
         else:
 
-            home_goals += a_goals
-            away_goals += h_goals
+            hg = g2
+            ag = g1
 
-            if a_goals > h_goals:
+        home_goals += hg
+        away_goals += ag
 
-                home_wins += 1
+        if hg > ag:
+            home_wins += 1
+            result = "HOME_WIN"
 
-            elif a_goals == h_goals:
+        elif hg == ag:
+            draws += 1
+            result = "DRAW"
 
-                draws += 1
+        else:
+            away_wins += 1
+            result = "AWAY_WIN"
 
-            else:
+        history.append({
 
-                away_wins += 1
+            "date":
+                match.get("date"),
 
-    total = (
-        home_wins
-        + draws
-        + away_wins
-    )
+            "home_team":
+                match.get("team1"),
+
+            "away_team":
+                match.get("team2"),
+
+            "score":
+                f"{g1}-{g2}",
+
+            "home_perspective_score":
+                f"{hg}-{ag}",
+
+            "result":
+                result,
+        })
+
+    total = len(h2h)
 
     return {
 
@@ -2198,245 +2161,121 @@ def _summarize_h2h(
             away_goals,
 
         "home_win_pct":
-            (
-                round(
-                    home_wins / total,
-                    4,
-                )
-                if total
-                else None
-            ),
+            round(
+                home_wins / total,
+                4,
+            )
+            if total
+            else None,
 
         "draw_pct":
-            (
-                round(
-                    draws / total,
-                    4,
-                )
-                if total
-                else None
-            ),
+            round(
+                draws / total,
+                4,
+            )
+            if total
+            else None,
 
         "away_win_pct":
-            (
-                round(
-                    away_wins / total,
-                    4,
-                )
-                if total
-                else None
-            ),
+            round(
+                away_wins / total,
+                4,
+            )
+            if total
+            else None,
+
+        "history":
+            history,
     }
 
 
-# ═══════════════════════════════════════════════════════════════════
-# ODDS
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
+# CURRENT CONTEXT
+# ================================================================
 
-def _get_fixture_odds(
-    fixture_id: int,
+def _build_current_context(
+    matches,
+    home_team,
+    away_team,
+    match_date,
 ):
 
-    cache_key = str(
-        fixture_id
+    standings = _calculate_standings(
+        matches,
+        before_date=match_date,
     )
 
-    cached = DATA_CACHE[
-        "odds"
-    ].get(cache_key)
+    home_standing = _find_standing(
+        standings,
+        home_team,
+    )
 
-    now = time.time()
+    away_standing = _find_standing(
+        standings,
+        away_team,
+    )
 
-    if cached:
+    home_form = _calculate_form(
+        matches,
+        home_team,
+        before_date=match_date,
+        limit=5,
+    )
 
-        if (
-            now
-            - cached["timestamp"]
-        ) < ODDS_CACHE_SECONDS:
+    away_form = _calculate_form(
+        matches,
+        away_team,
+        before_date=match_date,
+        limit=5,
+    )
 
-            return cached["data"]
+    h2h = _calculate_h2h(
+        matches,
+        home_team,
+        away_team,
+        before_date=match_date,
+        limit=10,
+    )
 
-    data = _api_football_get(
-        "/odds",
-        {
-            "fixture":
-                fixture_id,
+    return {
+
+        "standings": {
+
+            "home":
+                home_standing,
+
+            "away":
+                away_standing,
         },
-    )
 
-    DATA_CACHE[
-        "odds"
-    ][cache_key] = {
+        "form": {
 
-        "timestamp":
-            now,
+            "home":
+                home_form,
 
-        "data":
-            data,
+            "away":
+                away_form,
+        },
+
+        "h2h":
+            h2h,
+
+        "source":
+            "OpenFootball",
+
+        "odds":
+            None,
     }
 
-    return data
 
-
-def _extract_1x2_odds(
-    odds_response,
-):
-
-    if not odds_response:
-
-        return None
-
-    for bookmaker_block in odds_response:
-
-        bookmakers = (
-            bookmaker_block.get(
-                "bookmakers",
-                []
-            )
-        )
-
-        for bookmaker in bookmakers:
-
-            bets = bookmaker.get(
-                "bets",
-                []
-            )
-
-            for bet in bets:
-
-                bet_name = str(
-                    bet.get(
-                        "name",
-                        ""
-                    )
-                ).lower()
-
-                bet_id = bet.get(
-                    "id"
-                )
-
-                if not (
-                    bet_id == 1
-                    or
-                    "match winner"
-                    in bet_name
-                    or
-                    bet_name == "winner"
-                ):
-
-                    continue
-
-                values = bet.get(
-                    "values",
-                    []
-                )
-
-                home = None
-                draw = None
-                away = None
-
-                for value in values:
-
-                    label = str(
-                        value.get(
-                            "value",
-                            ""
-                        )
-                    ).lower()
-
-                    odd = value.get(
-                        "odd"
-                    )
-
-                    try:
-
-                        odd = float(
-                            odd
-                        )
-
-                    except (
-                        TypeError,
-                        ValueError,
-                    ):
-
-                        continue
-
-                    if label in (
-                        "home",
-                        "1",
-                    ):
-
-                        home = odd
-
-                    elif label in (
-                        "draw",
-                        "x",
-                    ):
-
-                        draw = odd
-
-                    elif label in (
-                        "away",
-                        "2",
-                    ):
-
-                        away = odd
-
-                if (
-                    home
-                    and
-                    draw
-                    and
-                    away
-                ):
-
-                    raw_h = 1 / home
-                    raw_d = 1 / draw
-                    raw_a = 1 / away
-
-                    total = (
-                        raw_h
-                        + raw_d
-                        + raw_a
-                    )
-
-                    return {
-
-                        "home":
-                            home,
-
-                        "draw":
-                            draw,
-
-                        "away":
-                            away,
-
-                        "prob_home":
-                            raw_h / total,
-
-                        "prob_draw":
-                            raw_d / total,
-
-                        "prob_away":
-                            raw_a / total,
-
-                        "bookmaker":
-                            bookmaker.get(
-                                "name"
-                            ),
-                    }
-
-    return None
-
-
-# ═══════════════════════════════════════════════════════════════════
-# CONFIDENCE ENGINE
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
+# CONFIDENCE
+# ================================================================
 
 def _clamp(
-    value: float,
-    minimum: float = 0.0,
-    maximum: float = 100.0,
+    value,
+    minimum=0,
+    maximum=100,
 ):
 
     return max(
@@ -2449,51 +2288,24 @@ def _clamp(
 
 
 def _confidence_label(
-    score: float,
+    score,
 ):
 
     if score >= 78:
-
         return "TRÈS FORT"
 
     if score >= 68:
-
         return "FORT"
 
     if score >= 58:
-
         return "MOYEN"
 
     return "FAIBLE"
 
 
-def _form_points(
-    form: str,
-):
-
-    value = 0
-
-    for char in (
-        form or ""
-    )[-5:]:
-
-        if char == "W":
-
-            value += 3
-
-        elif char == "D":
-
-            value += 1
-
-    return value
-
-
 def _calculate_confidence(
-    prediction: dict,
-    home_standing: dict | None,
-    away_standing: dict | None,
-    h2h_summary: dict | None,
-    odds: dict | None,
+    prediction,
+    current_context,
 ):
 
     goals = prediction.get(
@@ -2504,21 +2316,21 @@ def _calculate_confidence(
     p_home = float(
         goals.get(
             "home_win",
-            0
+            0,
         )
     )
 
     p_draw = float(
         goals.get(
             "draw",
-            0
+            0,
         )
     )
 
     p_away = float(
         goals.get(
             "away_win",
-            0
+            0,
         )
     )
 
@@ -2539,227 +2351,149 @@ def _calculate_confidence(
         key=probs.get,
     )
 
-    model_probability = (
-        probs[predicted_side]
-        * 100
+    ordered = sorted(
+        probs.values(),
+        reverse=True,
     )
 
-    # Base score.
+    top_probability = ordered[0]
+    second_probability = ordered[1]
+
+    margin = (
+        top_probability
+        - second_probability
+    )
+
     score = (
         45
         + max(
             0,
-            model_probability - 33,
-        ) * 0.65
+            top_probability * 100 - 33,
+        ) * 0.55
+        + max(
+            0,
+            margin * 100,
+        ) * 0.35
     )
 
     evidence = []
 
-    # ─────────────────────────────────────────────────────────────
-    # CURRENT TABLE
-    # ─────────────────────────────────────────────────────────────
+    standings = current_context.get(
+        "standings",
+        {}
+    )
+
+    home_standing = standings.get(
+        "home"
+    )
+
+    away_standing = standings.get(
+        "away"
+    )
 
     if (
         home_standing
-        and away_standing
+        and
+        away_standing
     ):
 
         hp = home_standing.get(
-            "points"
+            "points",
+            0,
         )
 
         ap = away_standing.get(
-            "points"
+            "points",
+            0,
         )
 
+        if predicted_side == "home" and hp > ap:
+
+            score += 5
+
+            evidence.append(
+                "Classement favorable au domicile"
+            )
+
+        elif predicted_side == "away" and ap > hp:
+
+            score += 5
+
+            evidence.append(
+                "Classement favorable à l'extérieur"
+            )
+
+    forms = current_context.get(
+        "form",
+        {}
+    )
+
+    hf = forms.get(
+        "home",
+        {}
+    ).get(
+        "ppg",
+        0,
+    )
+
+    af = forms.get(
+        "away",
+        {}
+    ).get(
+        "ppg",
+        0,
+    )
+
+    if predicted_side == "home" and hf > af:
+
+        score += 6
+
+        evidence.append(
+            "Forme récente favorable"
+        )
+
+    elif predicted_side == "away" and af > hf:
+
+        score += 6
+
+        evidence.append(
+            "Forme récente favorable"
+        )
+
+    h2h = current_context.get(
+        "h2h",
+        {}
+    )
+
+    if h2h.get("matches", 0) >= 3:
+
         if (
-            hp is not None
+            predicted_side == "home"
             and
-            ap is not None
-        ):
-
-            if (
-                predicted_side == "home"
-                and
-                hp > ap
-            ):
-
-                score += 5
-
-                evidence.append(
-                    "Classement favorable domicile"
-                )
-
-            elif (
-                predicted_side == "away"
-                and
-                ap > hp
-            ):
-
-                score += 5
-
-                evidence.append(
-                    "Classement favorable extérieur"
-                )
-
-    # ─────────────────────────────────────────────────────────────
-    # FORM
-    # ─────────────────────────────────────────────────────────────
-
-    home_form = (
-        home_standing.get(
-            "form"
-        )
-        if home_standing
-        else ""
-    )
-
-    away_form = (
-        away_standing.get(
-            "form"
-        )
-        if away_standing
-        else ""
-    )
-
-    hf = _form_points(
-        home_form
-    )
-
-    af = _form_points(
-        away_form
-    )
-
-    if predicted_side == "home":
-
-        if hf > af:
-
-            score += 7
-
-            evidence.append(
-                "Forme récente favorable"
-            )
-
-    elif predicted_side == "away":
-
-        if af > hf:
-
-            score += 7
-
-            evidence.append(
-                "Forme récente favorable"
-            )
-
-    # ─────────────────────────────────────────────────────────────
-    # H2H
-    # ─────────────────────────────────────────────────────────────
-
-    if h2h_summary:
-
-        h2h_home = (
-            h2h_summary.get(
+            (h2h.get(
                 "home_win_pct"
-            )
-        )
-
-        h2h_away = (
-            h2h_summary.get(
-                "away_win_pct"
-            )
-        )
-
-        if predicted_side == "home":
-
-            if (
-                h2h_home is not None
-                and
-                h2h_home >= 0.50
-            ):
-
-                score += 5
-
-                evidence.append(
-                    "H2H favorable"
-                )
-
-        elif predicted_side == "away":
-
-            if (
-                h2h_away is not None
-                and
-                h2h_away >= 0.50
-            ):
-
-                score += 5
-
-                evidence.append(
-                    "H2H favorable"
-                )
-
-    # ─────────────────────────────────────────────────────────────
-    # MARKET AGREEMENT
-    # ─────────────────────────────────────────────────────────────
-
-    market_probability = None
-
-    if odds:
-
-        market_probs = {
-
-            "home":
-                odds.get(
-                    "prob_home"
-                ),
-
-            "draw":
-                odds.get(
-                    "prob_draw"
-                ),
-
-            "away":
-                odds.get(
-                    "prob_away"
-                ),
-        }
-
-        market_probability = (
-            market_probs.get(
-                predicted_side
-            )
-        )
-
-        if (
-            market_probability
-            is not None
+            ) or 0) >= 0.50
         ):
 
-            difference = abs(
-                (
-                    model_probability
-                    / 100
-                )
-                - market_probability
+            score += 4
+
+            evidence.append(
+                "Historique H2H favorable"
             )
 
-            if difference <= 0.05:
+        elif (
+            predicted_side == "away"
+            and
+            (h2h.get(
+                "away_win_pct"
+            ) or 0) >= 0.50
+        ):
 
-                score += 8
+            score += 4
 
-                evidence.append(
-                    "Modèle et marché concordants"
-                )
-
-            elif difference <= 0.10:
-
-                score += 3
-
-            elif difference >= 0.18:
-
-                score -= 8
-
-                evidence.append(
-                    "Désaccord important avec le marché"
-                )
+            evidence.append(
+                "Historique H2H favorable"
+            )
 
     score = _clamp(
         score
@@ -2783,20 +2517,14 @@ def _calculate_confidence(
 
         "model_probability":
             round(
-                model_probability,
+                top_probability * 100,
                 2,
             ),
 
-        "market_probability":
-            (
-                round(
-                    market_probability
-                    * 100,
-                    2,
-                )
-                if market_probability
-                is not None
-                else None
+        "margin":
+            round(
+                margin * 100,
+                2,
             ),
 
         "evidence":
@@ -2804,12 +2532,12 @@ def _calculate_confidence(
     }
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # BEST PICK
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 def _build_best_pick(
-    prediction: dict,
+    prediction,
 ):
 
     goals = prediction.get(
@@ -2818,95 +2546,63 @@ def _build_best_pick(
     )
 
     if not goals:
-
         return None
 
-    candidates = []
-
-    home = float(
-        goals.get(
-            "home_win",
-            0
-        )
-    )
-
-    draw = float(
-        goals.get(
-            "draw",
-            0
-        )
-    )
-
-    away = float(
-        goals.get(
-            "away_win",
-            0
-        )
-    )
-
-    candidates.extend([
+    candidates = [
 
         {
-            "market":
-                "1",
-
+            "market": "1",
             "probability":
-                home,
-
+                float(
+                    goals.get(
+                        "home_win",
+                        0,
+                    )
+                ),
             "label":
                 "Victoire domicile",
         },
 
         {
-            "market":
-                "X",
-
+            "market": "X",
             "probability":
-                draw,
-
+                float(
+                    goals.get(
+                        "draw",
+                        0,
+                    )
+                ),
             "label":
                 "Match nul",
         },
 
         {
-            "market":
-                "2",
-
+            "market": "2",
             "probability":
-                away,
-
+                float(
+                    goals.get(
+                        "away_win",
+                        0,
+                    )
+                ),
             "label":
                 "Victoire extérieur",
         },
-    ])
+    ]
 
     ou = goals.get(
         "over_under",
         {}
     )
 
-    for line in (
+    for line in [
         "1.5",
         "2.5",
         "3.5",
-    ):
+    ]:
 
         if line not in ou:
             continue
-
-        over = float(
-            ou[line].get(
-                "over",
-                0
-            )
-        )
-
-        under = float(
-            ou[line].get(
-                "under",
-                0
-            )
-        )
 
         candidates.append({
 
@@ -2914,7 +2610,12 @@ def _build_best_pick(
                 f"Over {line}",
 
             "probability":
-                over,
+                float(
+                    ou[line].get(
+                        "over",
+                        0,
+                    )
+                ),
 
             "label":
                 f"Plus de {line} buts",
@@ -2926,7 +2627,12 @@ def _build_best_pick(
                 f"Under {line}",
 
             "probability":
-                under,
+                float(
+                    ou[line].get(
+                        "under",
+                        0,
+                    )
+                ),
 
             "label":
                 f"Moins de {line} buts",
@@ -2950,55 +2656,41 @@ def _build_best_pick(
 
         "probability":
             round(
-                best["probability"]
-                * 100,
+                best["probability"] * 100,
                 2,
             ),
     }
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # JSON CLEANER
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 def _clean_json(obj):
 
-    if isinstance(
-        obj,
-        dict,
-    ):
+    if isinstance(obj, dict):
 
         return {
             str(k):
                 _clean_json(v)
-
             for k, v in obj.items()
         }
 
-    if isinstance(
-        obj,
-        list,
-    ):
+    if isinstance(obj, list):
 
         return [
             _clean_json(v)
             for v in obj
         ]
 
-    if isinstance(
-        obj,
-        tuple,
-    ):
+    if isinstance(obj, tuple):
 
         return [
             _clean_json(v)
             for v in obj
         ]
 
-    if isinstance(
-        obj,
-        np.ndarray,
-    ):
+    if isinstance(obj, np.ndarray):
 
         return _clean_json(
             obj.tolist()
@@ -3025,31 +2717,27 @@ def _clean_json(obj):
     ):
 
         if np.isnan(obj):
-
             return None
 
         return float(obj)
 
     if obj is None:
-
         return None
 
     try:
 
         if pd.isna(obj):
-
             return None
 
     except Exception:
-
         pass
 
     return obj
 
 
-# ═══════════════════════════════════════════════════════════════════
-# GAGNE TEMPS — SINGLE MATCH
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
+# SINGLE MATCH
+# ================================================================
 
 @app.post(
     "/gagne-temps/predict",
@@ -3066,8 +2754,8 @@ async def gagne_temps_predict(
         raise HTTPException(
             status_code=503,
             detail=(
-                "GAGNE TEMPS predictor is not loaded. "
-                "Check features.csv and model files."
+                "GAGNE TEMPS predictor "
+                "is not loaded."
             ),
         )
 
@@ -3081,98 +2769,58 @@ async def gagne_temps_predict(
 
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Invalid match_date. "
-                "Use YYYY-MM-DD."
-            ),
+            detail="Invalid match_date.",
         )
 
-    home_team = (
-        req.home_team.strip()
+    home_team = req.home_team.strip()
+    away_team = req.away_team.strip()
+    league = req.league.strip().upper()
+    season = req.season.strip()
+
+    team_index = _build_team_index()
+
+    mapped_home = _match_dataset_team(
+        home_team,
+        team_index,
     )
 
-    away_team = (
-        req.away_team.strip()
+    mapped_away = _match_dataset_team(
+        away_team,
+        team_index,
     )
 
-    league = (
-        req.league.strip().upper()
-    )
-
-    season = (
-        req.season.strip()
-    )
-
-    if (
-        not home_team
-        or
-        not away_team
-    ):
+    if not mapped_home:
 
         raise HTTPException(
             status_code=400,
             detail=(
-                "home_team and away_team "
-                "are required."
+                f"Unknown home team: {home_team}"
             ),
         )
 
-    if (
-        home_team.lower()
-        == away_team.lower()
-    ):
+    if not mapped_away:
 
         raise HTTPException(
             status_code=400,
             detail=(
-                "home_team and away_team "
-                "must be different."
+                f"Unknown away team: {away_team}"
             ),
         )
 
-    df = club_predictor.df
-
-    known_home = (
-        home_team
-        in df["home_team"].values
-        or
-        home_team
-        in df["away_team"].values
-    )
-
-    known_away = (
-        away_team
-        in df["home_team"].values
-        or
-        away_team
-        in df["away_team"].values
-    )
-
-    if not known_home:
+    if league not in SUPPORTED_LEAGUES:
 
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Unknown home team: "
-                f"{home_team}."
-            ),
-        )
-
-    if not known_away:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unknown away team: "
-                f"{away_team}."
+                f"Unsupported league: {league}"
             ),
         )
 
     t0 = time.time()
 
     result = club_predictor.predict(
-        home_team=home_team,
-        away_team=away_team,
+        home_team=mapped_home,
+        away_team=mapped_away,
         league=league,
         season=season,
         match_date=match_date,
@@ -3180,19 +2828,11 @@ async def gagne_temps_predict(
     )
 
     elapsed = round(
-        (
-            time.time()
-            - t0
-        )
-        * 1000,
+        (time.time() - t0) * 1000,
         1,
     )
 
-    result = _clean_json(
-        result
-    )
-
-    return {
+    return _clean_json({
 
         "status":
             "success",
@@ -3204,6 +2844,12 @@ async def gagne_temps_predict(
 
             "away_team":
                 away_team,
+
+            "tika_home_team":
+                mapped_home,
+
+            "tika_away_team":
+                mapped_away,
 
             "league":
                 league,
@@ -3230,17 +2876,17 @@ async def gagne_temps_predict(
                 models.version,
 
             "data_source":
-                "data/opta/processed/features.csv",
+                "TikaML historical features",
 
             "elapsed_ms":
                 elapsed,
         },
-    }
+    })
 
 
-# ═══════════════════════════════════════════════════════════════════
-# GAGNE TEMPS — AUTOMATIC TODAY V2
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
+# TODAY
+# ================================================================
 
 @app.get(
     "/gagne-temps/today",
@@ -3260,595 +2906,346 @@ async def gagne_temps_today():
             ),
         )
 
-    if not API_FOOTBALL_KEY:
-
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "API_FOOTBALL_KEY is not configured "
-                "on Render."
-            ),
-        )
-
-    fixture_date = (
-        _get_today_fixture_date()
+    fixture_date = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d"
     )
 
-    fixtures = (
-        _get_cached_fixtures(
-            fixture_date
-        )
-    )
-
-    team_index = (
-        _build_team_index()
-    )
+    team_index = _build_team_index()
 
     results = []
     skipped = []
 
-    for fixture in fixtures:
+    total_fixtures = 0
+
+    # ------------------------------------------------------------
+    # LOAD EACH SUPPORTED LEAGUE
+    # ------------------------------------------------------------
+
+    for tika_code, league_info in (
+        SUPPORTED_LEAGUES.items()
+    ):
 
         try:
 
-            league_data = fixture.get(
-                "league",
-                {}
+            data = _get_openfootball_dataset(
+                tika_code,
+                str(
+                    datetime.now(
+                        timezone.utc
+                    ).year
+                ),
             )
-
-            league_id = league_data.get(
-                "id"
-            )
-
-            if (
-                league_id
-                not in SUPPORTED_LEAGUES
-            ):
-
-                continue
-
-            league_info = (
-                SUPPORTED_LEAGUES[
-                    league_id
-                ]
-            )
-
-            fixture_info = fixture.get(
-                "fixture",
-                {}
-            )
-
-            fixture_id = fixture_info.get(
-                "id"
-            )
-
-            teams = fixture.get(
-                "teams",
-                {}
-            )
-
-            home_obj = teams.get(
-                "home",
-                {}
-            )
-
-            away_obj = teams.get(
-                "away",
-                {}
-            )
-
-            home_api = home_obj.get(
-                "name"
-            )
-
-            away_api = away_obj.get(
-                "name"
-            )
-
-            home_api_id = home_obj.get(
-                "id"
-            )
-
-            away_api_id = away_obj.get(
-                "id"
-            )
-
-            # ─────────────────────────────────────────────────────
-            # TEAM MATCHING
-            # ─────────────────────────────────────────────────────
-
-            home_team = (
-                _match_dataset_team(
-                    home_api,
-                    team_index,
-                )
-            )
-
-            away_team = (
-                _match_dataset_team(
-                    away_api,
-                    team_index,
-                )
-            )
-
-            if (
-                not home_team
-                or
-                not away_team
-            ):
-
-                skipped.append({
-
-                    "fixture_id":
-                        fixture_id,
-
-                    "home_team":
-                        home_api,
-
-                    "away_team":
-                        away_api,
-
-                    "league":
-                        league_info[
-                            "name"
-                        ],
-
-                    "reason":
-                        "Team name not found "
-                        "in TikaML dataset.",
-                })
-
-                continue
-
-            # ─────────────────────────────────────────────────────
-            # DATE
-            # ─────────────────────────────────────────────────────
-
-            date_time = fixture_info.get(
-                "date"
-            )
-
-            match_date = (
-                date_time[:10]
-                if date_time
-                else fixture_date
-            )
-
-            # ─────────────────────────────────────────────────────
-            # WEEK
-            # ─────────────────────────────────────────────────────
-
-            round_name = league_data.get(
-                "round"
-            )
-
-            week_number = None
-
-            if round_name:
-
-                round_match = re.search(
-                    r"(\d+)",
-                    str(round_name),
-                )
-
-                if round_match:
-
-                    week_number = int(
-                        round_match.group(1)
-                    )
-
-            # ─────────────────────────────────────────────────────
-            # SEASON
-            # ─────────────────────────────────────────────────────
-
-            api_season = league_data.get(
-                "season"
-            )
-
-            if api_season is None:
-
-                api_season = datetime.now(
-                    timezone.utc
-                ).year
-
-            # ─────────────────────────────────────────────────────
-            # STANDINGS
-            # ─────────────────────────────────────────────────────
-
-            standings_response = (
-                _get_current_standings(
-                    league_id,
-                    int(api_season),
-                )
-            )
-
-            home_standing = (
-                _extract_team_standing(
-                    standings_response,
-                    home_api_id,
-                    home_api,
-                )
-            )
-
-            away_standing = (
-                _extract_team_standing(
-                    standings_response,
-                    away_api_id,
-                    away_api,
-                )
-            )
-
-            # ─────────────────────────────────────────────────────
-            # H2H
-            # ─────────────────────────────────────────────────────
-
-            h2h_summary = None
-
-            if (
-                home_api_id
-                and
-                away_api_id
-            ):
-
-                h2h_response = (
-                    _get_h2h(
-                        home_api_id,
-                        away_api_id,
-                    )
-                )
-
-                h2h_summary = (
-                    _summarize_h2h(
-                        h2h_response,
-                        home_api_id,
-                    )
-                )
-
-            # ─────────────────────────────────────────────────────
-            # ODDS
-            # ─────────────────────────────────────────────────────
-
-            odds = None
-
-            if fixture_id:
-
-                try:
-
-                    odds_response = (
-                        _get_fixture_odds(
-                            fixture_id
-                        )
-                    )
-
-                    odds = (
-                        _extract_1x2_odds(
-                            odds_response
-                        )
-                    )
-
-                except Exception as odds_error:
-
-                    log.warning(
-                        f"Odds unavailable "
-                        f"for fixture "
-                        f"{fixture_id}: "
-                        f"{odds_error}"
-                    )
-
-            # ─────────────────────────────────────────────────────
-            # TIKAML
-            # ─────────────────────────────────────────────────────
-
-            t0 = time.time()
-
-            prediction = (
-                club_predictor.predict(
-                    home_team=home_team,
-                    away_team=away_team,
-                    league=(
-                        league_info[
-                            "tika_code"
-                        ]
-                    ),
-                    season=str(
-                        api_season
-                    ),
-                    match_date=pd.Timestamp(
-                        match_date
-                    ),
-                    week=week_number,
-                    odds=odds,
-                )
-            )
-
-            elapsed = round(
-                (
-                    time.time()
-                    - t0
-                ) * 1000,
-                1,
-            )
-
-            prediction = _clean_json(
-                prediction
-            )
-
-            # ─────────────────────────────────────────────────────
-            # BEST PICK
-            # ─────────────────────────────────────────────────────
-
-            best_pick = (
-                _build_best_pick(
-                    prediction
-                )
-            )
-
-            # ─────────────────────────────────────────────────────
-            # CONFIDENCE
-            # ─────────────────────────────────────────────────────
-
-            confidence = (
-                _calculate_confidence(
-                    prediction,
-                    home_standing,
-                    away_standing,
-                    h2h_summary,
-                    odds,
-                )
-            )
-
-            # ─────────────────────────────────────────────────────
-            # CURRENT FORM
-            # ─────────────────────────────────────────────────────
-
-            home_form = (
-                home_standing.get(
-                    "form"
-                )
-                if home_standing
-                else None
-            )
-
-            away_form = (
-                away_standing.get(
-                    "form"
-                )
-                if away_standing
-                else None
-            )
-
-            # ─────────────────────────────────────────────────────
-            # CURRENT TABLE
-            # ─────────────────────────────────────────────────────
-
-            table_context = {
-
-                "home": {
-
-                    "rank":
-                        (
-                            home_standing.get(
-                                "rank"
-                            )
-                            if home_standing
-                            else None
-                        ),
-
-                    "points":
-                        (
-                            home_standing.get(
-                                "points"
-                            )
-                            if home_standing
-                            else None
-                        ),
-
-                    "goals_diff":
-                        (
-                            home_standing.get(
-                                "goalsDiff"
-                            )
-                            if home_standing
-                            else None
-                        ),
-
-                    "form":
-                        home_form,
-
-                    "home_record":
-                        (
-                            home_standing.get(
-                                "home"
-                            )
-                            if home_standing
-                            else None
-                        ),
-                },
-
-                "away": {
-
-                    "rank":
-                        (
-                            away_standing.get(
-                                "rank"
-                            )
-                            if away_standing
-                            else None
-                        ),
-
-                    "points":
-                        (
-                            away_standing.get(
-                                "points"
-                            )
-                            if away_standing
-                            else None
-                        ),
-
-                    "goals_diff":
-                        (
-                            away_standing.get(
-                                "goalsDiff"
-                            )
-                            if away_standing
-                            else None
-                        ),
-
-                    "form":
-                        away_form,
-
-                    "away_record":
-                        (
-                            away_standing.get(
-                                "away"
-                            )
-                            if away_standing
-                            else None
-                        ),
-                },
-            }
-
-            results.append({
-
-                "fixture_id":
-                    fixture_id,
-
-                "status":
-                    fixture_info.get(
-                        "status",
-                        {},
-                    ).get(
-                        "short"
-                    ),
-
-                "kickoff":
-                    date_time,
-
-                "match": {
-
-                    "home_team":
-                        home_api,
-
-                    "away_team":
-                        away_api,
-
-                    "tika_home_team":
-                        home_team,
-
-                    "tika_away_team":
-                        away_team,
-                },
-
-                "league": {
-
-                    "id":
-                        league_id,
-
-                    "name":
-                        league_info[
-                            "name"
-                        ],
-
-                    "tika_code":
-                        league_info[
-                            "tika_code"
-                        ],
-                },
-
-                "season":
-                    str(
-                        api_season
-                    ),
-
-                "week":
-                    week_number,
-
-                "prediction":
-                    prediction,
-
-                "best_pick":
-                    best_pick,
-
-                "confidence":
-                    confidence,
-
-                "current_context": {
-
-                    "standings":
-                        table_context,
-
-                    "h2h":
-                        h2h_summary,
-
-                    "odds":
-                        odds,
-                },
-
-                "model_metadata": {
-
-                    "engine":
-                        "TikaML MatchPredictor",
-
-                    "version":
-                        models.version,
-
-                    "source":
-                        "API-Football + TikaML",
-
-                    "live_context":
-                        True,
-
-                    "elapsed_ms":
-                        elapsed,
-                },
-            })
 
         except Exception as e:
 
             log.exception(
-                "Automatic GAGNE TEMPS "
-                "prediction failed"
+                f"OpenFootball failed "
+                f"for {tika_code}"
             )
 
             skipped.append({
 
-                "fixture_id":
-                    fixture.get(
-                        "fixture",
-                        {},
-                    ).get(
-                        "id"
-                    ),
-
-                "home_team":
-                    fixture.get(
-                        "teams",
-                        {},
-                    ).get(
-                        "home",
-                        {},
-                    ).get(
-                        "name"
-                    ),
-
-                "away_team":
-                    fixture.get(
-                        "teams",
-                        {},
-                    ).get(
-                        "away",
-                        {},
-                    ).get(
-                        "name"
-                    ),
+                "league":
+                    league_info["name"],
 
                 "reason":
                     str(e),
             })
 
-    # ═════════════════════════════════════════════════════════════
-    # SORT
-    # ═════════════════════════════════════════════════════════════
+            continue
+
+        matches = data.get(
+            "matches",
+            []
+        )
+
+        total_fixtures += len(matches)
+
+        # --------------------------------------------------------
+        # TODAY'S MATCHES
+        # --------------------------------------------------------
+
+        today_matches = [
+
+            match
+
+            for match in matches
+
+            if match.get(
+                "date"
+            ) == fixture_date
+        ]
+
+        if not today_matches:
+
+            continue
+
+        for match in today_matches:
+
+            try:
+
+                api_home = match.get(
+                    "team1"
+                )
+
+                api_away = match.get(
+                    "team2"
+                )
+
+                home_team = _match_dataset_team(
+                    api_home,
+                    team_index,
+                )
+
+                away_team = _match_dataset_team(
+                    api_away,
+                    team_index,
+                )
+
+                if (
+                    not home_team
+                    or
+                    not away_team
+                ):
+
+                    skipped.append({
+
+                        "league":
+                            league_info["name"],
+
+                        "home_team":
+                            api_home,
+
+                        "away_team":
+                            api_away,
+
+                        "reason":
+                            "Team name not found "
+                            "in TikaML dataset.",
+                    })
+
+                    continue
+
+                # ------------------------------------------------
+                # CURRENT CONTEXT
+                # ------------------------------------------------
+
+                context = _build_current_context(
+                    matches,
+                    api_home,
+                    api_away,
+                    fixture_date,
+                )
+
+                # ------------------------------------------------
+                # ROUND
+                # ------------------------------------------------
+
+                round_name = match.get(
+                    "round"
+                )
+
+                week_number = None
+
+                if round_name:
+
+                    found = re.search(
+                        r"(\d+)",
+                        str(round_name),
+                    )
+
+                    if found:
+
+                        week_number = int(
+                            found.group(1)
+                        )
+
+                # ------------------------------------------------
+                # TIKAML
+                # ------------------------------------------------
+
+                t0 = time.time()
+
+                prediction = club_predictor.predict(
+                    home_team=home_team,
+                    away_team=away_team,
+                    league=tika_code,
+                    season=str(
+                        datetime.now(
+                            timezone.utc
+                        ).year
+                    ),
+                    match_date=pd.Timestamp(
+                        fixture_date
+                    ),
+                    week=week_number,
+                    odds=None,
+                )
+
+                elapsed = round(
+                    (time.time() - t0) * 1000,
+                    1,
+                )
+
+                prediction = _clean_json(
+                    prediction
+                )
+
+                # ------------------------------------------------
+                # BEST PICK
+                # ------------------------------------------------
+
+                best_pick = _build_best_pick(
+                    prediction
+                )
+
+                # ------------------------------------------------
+                # CONFIDENCE
+                # ------------------------------------------------
+
+                confidence = _calculate_confidence(
+                    prediction,
+                    context,
+                )
+
+                # ------------------------------------------------
+                # RESULT
+                # ------------------------------------------------
+
+                result = {
+
+                    "fixture_id":
+                        f"{tika_code}-"
+                        f"{fixture_date}-"
+                        f"{_normalize_team_name(api_home)}-"
+                        f"{_normalize_team_name(api_away)}",
+
+                    "status":
+                        (
+                            "FINISHED"
+                            if _match_is_finished(match)
+                            else
+                            "SCHEDULED"
+                        ),
+
+                    "kickoff":
+                        match.get(
+                            "time"
+                        ),
+
+                    "match": {
+
+                        "home_team":
+                            api_home,
+
+                        "away_team":
+                            api_away,
+
+                        "tika_home_team":
+                            home_team,
+
+                        "tika_away_team":
+                            away_team,
+                    },
+
+                    "league": {
+
+                        "name":
+                            league_info["name"],
+
+                        "tika_code":
+                            tika_code,
+
+                        "openfootball":
+                            league_info[
+                                "openfootball_code"
+                            ],
+                    },
+
+                    "season":
+                        str(
+                            datetime.now(
+                                timezone.utc
+                            ).year
+                        ),
+
+                    "week":
+                        week_number,
+
+                    "prediction":
+                        prediction,
+
+                    "best_pick":
+                        best_pick,
+
+                    "confidence":
+                        confidence,
+
+                    "current_context":
+                        context,
+
+                    "model_metadata": {
+
+                        "engine":
+                            "TikaML MatchPredictor",
+
+                        "version":
+                            models.version,
+
+                        "source":
+                            "OpenFootball + TikaML",
+
+                        "odds":
+                            False,
+
+                        "standings":
+                            True,
+
+                        "form":
+                            True,
+
+                        "h2h":
+                            True,
+
+                        "elapsed_ms":
+                            elapsed,
+                    },
+                }
+
+                results.append(
+                    result
+                )
+
+            except Exception as e:
+
+                log.exception(
+                    "GAGNE TEMPS prediction failed"
+                )
+
+                skipped.append({
+
+                    "league":
+                        league_info["name"],
+
+                    "home_team":
+                        match.get(
+                            "team1"
+                        ),
+
+                    "away_team":
+                        match.get(
+                            "team2"
+                        ),
+
+                    "reason":
+                        str(e),
+                })
+
+    # ------------------------------------------------------------
+    # SORT BY CONFIDENCE
+    # ------------------------------------------------------------
 
     results.sort(
         key=lambda item:
@@ -3857,14 +3254,14 @@ async def gagne_temps_today():
                 {}
             ).get(
                 "score",
-                0
+                0,
             ),
         reverse=True,
     )
 
-    # ═════════════════════════════════════════════════════════════
+    # ------------------------------------------------------------
     # TOP 5
-    # ═════════════════════════════════════════════════════════════
+    # ------------------------------------------------------------
 
     top5 = []
 
@@ -3872,6 +3269,14 @@ async def gagne_temps_today():
         results[:5],
         start=1,
     ):
+
+        goals = item.get(
+            "prediction",
+            {}
+        ).get(
+            "goals",
+            {}
+        )
 
         top5.append({
 
@@ -3909,13 +3314,7 @@ async def gagne_temps_today():
                 ),
 
             "recommended_score":
-                item.get(
-                    "prediction",
-                    {}
-                ).get(
-                    "goals",
-                    {}
-                ).get(
+                goals.get(
                     "recommended_score"
                 ),
         })
@@ -3929,7 +3328,7 @@ async def gagne_temps_today():
             fixture_date,
 
         "source":
-            "API-Football + TikaML",
+            "OpenFootball + TikaML",
 
         "model":
             "TikaML MatchPredictor",
@@ -3939,13 +3338,12 @@ async def gagne_temps_today():
 
         "supported_leagues":
             [
-                league["name"]
-                for league
-                in SUPPORTED_LEAGUES.values()
+                x["name"]
+                for x in SUPPORTED_LEAGUES.values()
             ],
 
-        "total_api_fixtures":
-            len(fixtures),
+        "total_openfootball_matches":
+            total_fixtures,
 
         "predictions_count":
             len(results),
@@ -3962,6 +3360,15 @@ async def gagne_temps_today():
         "skipped":
             skipped,
 
+        "odds":
+            {
+                "available":
+                    False,
+
+                "reason":
+                    "OpenFootball does not provide bookmaker odds.",
+            },
+
         "disclaimer":
             (
                 "Predictions are statistical estimates "
@@ -3970,9 +3377,9 @@ async def gagne_temps_today():
     })
 
 
-# ═══════════════════════════════════════════════════════════════════
-# GAGNE TEMPS — TOP 5
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
+# TOP 5
+# ================================================================
 
 @app.get(
     "/gagne-temps/top",
@@ -3981,10 +3388,6 @@ async def gagne_temps_today():
     ],
 )
 async def gagne_temps_top():
-
-    """
-    Lightweight endpoint for the mobile application.
-    """
 
     data = await gagne_temps_today()
 
@@ -4018,9 +3421,9 @@ async def gagne_temps_top():
     }
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # STANDARD /predict
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 @app.post(
     "/predict",
@@ -4043,11 +3446,8 @@ async def predict(
     t0 = time.time()
 
     if (
-        req.prediction_type
-        == "live"
-
-        and
-        req.match_context
+        req.prediction_type == "live"
+        and req.match_context
     ):
 
         predictions = predict_live(
@@ -4064,21 +3464,8 @@ async def predict(
         )
 
     elapsed = round(
-        (
-            time.time()
-            - t0
-        )
-        * 1000,
+        (time.time() - t0) * 1000,
         1,
-    )
-
-    log.info(
-        f"predict "
-        f"match_id={req.match_id} "
-        f"type={req.prediction_type} "
-        f"trigger={req.trigger} "
-        f"models={list(predictions.keys())} "
-        f"elapsed={elapsed}ms"
     )
 
     return PredictionResponse(
@@ -4099,9 +3486,9 @@ async def predict(
     )
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # BACKFILL
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 @app.post(
     "/backfill",
@@ -4132,19 +3519,8 @@ async def backfill(
     )
 
     elapsed = round(
-        (
-            time.time()
-            - t0
-        )
-        * 1000,
+        (time.time() - t0) * 1000,
         1,
-    )
-
-    log.info(
-        f"backfill "
-        f"match_id={req.match_id} "
-        f"models={list(predictions.keys())} "
-        f"elapsed={elapsed}ms"
     )
 
     return PredictionResponse(
@@ -4165,9 +3541,9 @@ async def backfill(
     )
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 # MODEL STATUS
-# ═══════════════════════════════════════════════════════════════════
+# ================================================================
 
 @app.get(
     "/model-status"
@@ -4230,48 +3606,37 @@ async def model_status():
                 ),
         },
 
-        "api_football": {
+        "football_data": {
 
-            "configured":
-                bool(
-                    API_FOOTBALL_KEY
-                ),
+            "provider":
+                "OpenFootball",
 
-            "integration":
-                "API-Football + TikaML",
+            "api_key_required":
+                False,
 
-            "current_data": [
+            "source":
+                "GitHub raw JSON",
 
-                "fixtures",
-                "standings",
-                "form",
-                "home_away",
-                "h2h",
-                "odds",
-            ],
+            "repository":
+                "openfootball/football.json",
 
-            "supported_leagues":
+            "current_season":
+                "2026-27",
+
+            "leagues":
                 [
                     {
-
-                        "id":
-                            league_id,
+                        "code":
+                            code,
 
                         "name":
-                            league[
-                                "name"
-                            ],
+                            league["name"],
 
-                        "tika_code":
-                            league[
-                                "tika_code"
-                            ],
+                        "file":
+                            league["file"],
                     }
 
-                    for (
-                        league_id,
-                        league
-                    )
+                    for code, league
                     in SUPPORTED_LEAGUES.items()
                 ],
         },
