@@ -1,19 +1,12 @@
 """
-GAGNE TEMPS - Prediction API
-
-Architecture:
-    OpenFootball
-        ↓
-    TikaML MatchPredictor
-        ↓
-    Probabilités / Poisson
-        ↓
-    GAGNE TEMPS Selection Engine
-        ↓
-    PREMIUM / BON PRONOSTIC / RISQUÉ / À ÉVITER
+GAGNE TEMPS API
+Football prediction API using:
+- OpenFootball
+- TikaML MatchPredictor
+- GAGNE TEMPS Selection Engine
 
 Routes publiques:
-    GET / 
+    GET /
     GET /health
     GET /gagne-temps/health
     GET /gagne-temps/leagues
@@ -22,35 +15,29 @@ Routes publiques:
     GET /gagne-temps/predict
 
 Routes protégées:
-    POST /predict
+    GET /predict
     GET /model-status
     GET /debug/openfootball/{league_code}
 """
 
-from __future__ import annotations
-
-import json
-import logging
-import math
 import os
-import re
-import secrets
-import time
-from datetime import datetime, date, timezone
+import json
+import math
+import logging
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
-import numpy as np
-import pandas as pd
 import requests
-
-from fastapi import Depends, FastAPI, HTTPException, Security
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from src.inference import MatchPredictor
-from src.selection_engine import select_prediction
+
+try:
+    from src.selection_engine import select_prediction
+except Exception:
+    select_prediction = None
 
 
 # ============================================================
@@ -58,17 +45,19 @@ from src.selection_engine import select_prediction
 # ============================================================
 
 APP_NAME = "GAGNE TEMPS"
-
-OPENFOOTBALL_BASE = (
-    "https://raw.githubusercontent.com/openfootball/football.json/"
-    "master/2026-27"
-)
+MODEL_VERSION = "lgbm-poisson-85f"
 
 MAX_GOALS = 7
+OPENFOOTBALL_BASE = (
+    "https://raw.githubusercontent.com/openfootball/football.json/master"
+)
 
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = 12
 
-CACHE_TTL = 300
+TIKA_API_KEY = os.getenv("TIKA_API_KEY", "")
+
+CACHE_DIR = Path("/tmp/gagne_temps_cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
@@ -77,44 +66,10 @@ CACHE_TTL = 300
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
 log = logging.getLogger("gagne-temps")
-
-
-# ============================================================
-# API KEY
-# ============================================================
-
-API_KEY = os.environ.get("TIKA_API_KEY", "")
-
-if not API_KEY:
-    API_KEY = secrets.token_urlsafe(32)
-    log.warning(
-        "TIKA_API_KEY non configurée. "
-        "Une clé temporaire a été générée."
-    )
-
-api_key_header = APIKeyHeader(
-    name="X-API-Key",
-    auto_error=False,
-)
-
-
-async def verify_api_key(
-    key: str = Security(api_key_header),
-):
-    if not key or not secrets.compare_digest(
-        key,
-        API_KEY,
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid API key",
-        )
-
-    return key
 
 
 # ============================================================
@@ -122,1464 +77,1118 @@ async def verify_api_key(
 # ============================================================
 
 app = FastAPI(
-    title="GAGNE TEMPS",
-    description=(
-        "Football prediction API powered by "
-        "TikaML + OpenFootball + GAGNE TEMPS Selection Engine"
-    ),
-    version="2.0.0",
-)
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    title=APP_NAME,
+    description="Football prediction API powered by TikaML + OpenFootball",
+    version=MODEL_VERSION,
 )
 
 
 # ============================================================
-# TIKAML
+# TIKAML PREDICTOR
 # ============================================================
 
 club_predictor: Optional[MatchPredictor] = None
-
-MODEL_VERSION = "unknown"
-
-
-# ============================================================
-# LEAGUES
-# ============================================================
-
-LEAGUES = {
-    "EPL": {
-        "name": "Premier League",
-        "country": "England",
-        "file": "en.1.json",
-    },
-    "LL": {
-        "name": "La Liga",
-        "country": "Spain",
-        "file": "es.1.json",
-    },
-    "SEA": {
-        "name": "Serie A",
-        "country": "Italy",
-        "file": "it.1.json",
-    },
-    "BUN": {
-        "name": "Bundesliga",
-        "country": "Germany",
-        "file": "de.1.json",
-    },
-    "LI1": {
-        "name": "Ligue 1",
-        "country": "France",
-        "file": "fr.1.json",
-    },
-}
+predictor_error: Optional[str] = None
 
 
-# ============================================================
-# ALIAS EQUIPES
-# ============================================================
-
-TEAM_ALIASES = {
-
-    "1. FC Union Berlin": [
-        "Union Berlin",
-        "1. FC Union Berlin",
-    ],
-
-    "FC Schalke 04": [
-        "Schalke 04",
-        "FC Schalke 04",
-    ],
-
-    "Stade Rennais FC 1901": [
-        "Rennes",
-        "Stade Rennais",
-        "Stade Rennais FC 1901",
-    ],
-
-    "Olympique de Marseille": [
-        "Olympique Marseille",
-        "Marseille",
-        "Olympique de Marseille",
-    ],
-
-    "Sevilla FC": [
-        "Sevilla",
-        "Sevilla FC",
-    ],
-
-    "Valencia CF": [
-        "Valencia",
-        "Valencia CF",
-    ],
-
-    "Venezia FC": [
-        "Venezia",
-        "Venezia FC",
-    ],
-
-    "ACF Fiorentina": [
-        "Fiorentina",
-        "ACF Fiorentina",
-    ],
-
-    "FC Internazionale Milano": [
-        "Inter",
-        "Internazionale",
-        "Inter Milan",
-    ],
-
-    "AS Roma": [
-        "Roma",
-        "AS Roma",
-    ],
-
-    "AC Milan": [
-        "Milan",
-        "AC Milan",
-    ],
-
-    "SSC Napoli": [
-        "Napoli",
-        "SSC Napoli",
-    ],
-
-    "Juventus FC": [
-        "Juventus",
-        "Juventus FC",
-    ],
-
-    "Lazio": [
-        "Lazio",
-        "SS Lazio",
-    ],
-
-    "Atalanta BC": [
-        "Atalanta",
-        "Atalanta BC",
-    ],
-
-    "Bologna FC 1909": [
-        "Bologna",
-        "Bologna FC 1909",
-    ],
-
-    "Torino FC": [
-        "Torino",
-        "Torino FC",
-    ],
-
-    "Genoa CFC": [
-        "Genoa",
-        "Genoa CFC",
-    ],
-
-    "US Lecce": [
-        "Lecce",
-        "US Lecce",
-    ],
-
-    "Cagliari Calcio": [
-        "Cagliari",
-        "Cagliari Calcio",
-    ],
-
-    "Como 1907": [
-        "Como",
-        "Como 1907",
-    ],
-}
-
-
-# ============================================================
-# CACHE OPENFOOTBALL
-# ============================================================
-
-_openfootball_cache: dict[str, dict[str, Any]] = {}
-
-
-# ============================================================
-# OUTILS GENERAUX
-# ============================================================
-
-def safe_float(
-    value: Any,
-    default: float = 0.0,
-) -> float:
-
-    try:
-        value = float(value)
-
-        if not math.isfinite(value):
-            return default
-
-        return value
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-        return default
-
-
-def normalize_probability(
-    value: Any,
-) -> float:
-
-    if isinstance(value, str):
-        value = value.replace("%", "").strip()
-
-    value = safe_float(value)
-
-    if value > 1:
-        value /= 100
-
-    return max(
-        0.0,
-        min(1.0, value),
-    )
-
-
-def percentage(
-    value: Any,
-) -> float:
-
-    return round(
-        normalize_probability(value) * 100,
-        1,
-    )
-
-
-def normalize_team_name(
-    name: str,
-) -> str:
-
-    if not name:
-        return ""
-
-    value = name.lower().strip()
-
-    value = re.sub(
-        r"[^a-z0-9à-ÿ ]",
-        " ",
-        value,
-    )
-
-    value = re.sub(
-        r"\s+",
-        " ",
-        value,
-    )
-
-    return value.strip()
-
-
-# ============================================================
-# SAISON
-# ============================================================
-
-def current_season() -> str:
+def load_predictor() -> Optional[MatchPredictor]:
     """
-    Saison actuelle utilisée par OpenFootball/TikaML.
+    Charge le modèle TikaML une seule fois.
     """
-
-    return "2026-2027"
-
-
-# ============================================================
-# MODELE
-# ============================================================
-
-def load_predictor() -> None:
-
     global club_predictor
-    global MODEL_VERSION
+    global predictor_error
 
-    log.info(
-        "Chargement du modèle TikaML..."
-    )
-
-    predictor = MatchPredictor()
-
-    predictor.load_model()
-
-    club_predictor = predictor
+    if club_predictor is not None:
+        return club_predictor
 
     try:
+        log.info("Chargement du modèle TikaML...")
 
-        meta_path = Path(
-            "models/meta.json"
-        )
+        predictor = MatchPredictor()
 
-        if meta_path.exists():
+        # Important:
+        # on utilise load_model(), pas model.predict()
+        predictor.load_model()
 
-            with open(
-                meta_path,
-                "r",
-                encoding="utf-8",
-            ) as f:
+        club_predictor = predictor
+        predictor_error = None
 
-                meta = json.load(f)
+        log.info("TikaML chargé avec succès.")
 
-            feature_count = len(
-                meta.get(
-                    "feature_cols",
-                    [],
-                )
-            )
-
-            MODEL_VERSION = (
-                f"lgbm-poisson-{feature_count}f"
-            )
-
-        else:
-
-            MODEL_VERSION = (
-                "lgbm-poisson"
-            )
+        return club_predictor
 
     except Exception as exc:
-
-        log.warning(
-            "Impossible de lire models/meta.json: %s",
-            exc,
-        )
-
-        MODEL_VERSION = (
-            "lgbm-poisson"
-        )
-
-    log.info(
-        "TikaML chargé: %s",
-        MODEL_VERSION,
-    )
-
-
-@app.on_event("startup")
-async def startup_event():
-
-    try:
-
-        load_predictor()
-
-    except Exception as exc:
+        predictor_error = str(exc)
 
         log.exception(
-            "Erreur chargement TikaML: %s",
+            "Impossible de charger le modèle TikaML: %s",
             exc,
         )
+
+        return None
+
+
+# Chargement au démarrage.
+# On ne fait pas échouer complètement FastAPI si le modèle
+# rencontre un problème.
+@app.on_event("startup")
+def startup_event():
+    log.info("==========================================")
+    log.info("Démarrage %s", APP_NAME)
+    log.info("Version: %s", MODEL_VERSION)
+    log.info("==========================================")
+
+    load_predictor()
+
+
+# ============================================================
+# JSON SAFE
+# ============================================================
+
+def json_safe(value: Any) -> Any:
+    """
+    Convertit récursivement:
+    - numpy.ndarray
+    - numpy.float32/64
+    - numpy.int64
+    - tuples
+    - NaN
+    - Infinity
+    - dicts
+    - listes
+
+    en objets JSON compatibles.
+    """
+
+    if value is None:
+        return None
+
+    # bool/int/float/string natifs
+    if isinstance(value, (str, bool, int)):
+        return value
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    # NumPy sans importer numpy explicitement
+    # pour garder le serveur plus léger.
+    module_name = getattr(type(value), "__module__", "")
+
+    if module_name.startswith("numpy"):
+        # ndarray
+        if hasattr(value, "tolist"):
+            try:
+                return json_safe(value.tolist())
+            except Exception:
+                pass
+
+        # numpy scalar
+        if hasattr(value, "item"):
+            try:
+                return json_safe(value.item())
+            except Exception:
+                pass
+
+    if isinstance(value, dict):
+        result = {}
+
+        for key, item in value.items():
+            result[str(key)] = json_safe(item)
+
+        return result
+
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(item) for item in value]
+
+    # Pandas Timestamp / datetime
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+
+    # Fallback
+    try:
+        return str(value)
+    except Exception:
+        return None
 
 
 # ============================================================
 # OPENFOOTBALL
 # ============================================================
 
-def fetch_openfootball(
-    league_code: str,
-) -> dict[str, Any]:
+LEAGUES = {
+    "EPL": {
+        "name": "Premier League",
+        "file": "en.1.json",
+    },
+    "LL": {
+        "name": "La Liga",
+        "file": "es.1.json",
+    },
+    "SEA": {
+        "name": "Serie A",
+        "file": "it.1.json",
+    },
+    "BUN": {
+        "name": "Bundesliga",
+        "file": "de.1.json",
+    },
+    "LI1": {
+        "name": "Ligue 1",
+        "file": "fr.1.json",
+    },
+}
 
-    league_code = league_code.upper()
 
-    if league_code not in LEAGUES:
+TEAM_ALIASES = {
+    # Allemagne
+    "1. FC Union Berlin": "Union Berlin",
+    "FC Union Berlin": "Union Berlin",
+
+    "FC Schalke 04": "Schalke 04",
+
+    # France
+    "Stade Rennais FC 1901": "Rennes",
+    "Stade Rennais": "Rennes",
+
+    "Olympique de Marseille": "Olympique Marseille",
+    "Olympique Marseille": "Olympique Marseille",
+
+    # Espagne
+    "Sevilla FC": "Sevilla",
+    "Sevilla": "Sevilla",
+
+    "Valencia CF": "Valencia",
+    "Valencia": "Valencia",
+
+    # Italie
+    "Venezia FC": "Venezia",
+    "Venezia": "Venezia",
+
+    "ACF Fiorentina": "Fiorentina",
+    "Fiorentina": "Fiorentina",
+}
+
+
+def normalize_team_name(name: str) -> str:
+    """
+    Normalisation simple.
+    """
+
+    if not name:
+        return ""
+
+    name = " ".join(str(name).strip().split())
+
+    if name in TEAM_ALIASES:
+        return TEAM_ALIASES[name]
+
+    return name
+
+
+def candidate_team_names(name: str) -> List[str]:
+    """
+    Retourne plusieurs variantes possibles.
+    """
+
+    original = " ".join(str(name).strip().split())
+
+    candidates = [
+        original,
+        normalize_team_name(original),
+    ]
+
+    # Ajoute les alias inverses
+    for source, target in TEAM_ALIASES.items():
+        if target == original:
+            candidates.append(source)
+
+    # Supprime doublons
+    result = []
+
+    for item in candidates:
+        if item and item not in result:
+            result.append(item)
+
+    return result
+
+
+def get_current_season() -> str:
+    """
+    OpenFootball utilise ici la saison 2026-27.
+    Pour septembre 2026, nous sommes dans 2026-27.
+    """
+
+    now = datetime.now(timezone.utc)
+
+    if now.month >= 7:
+        start = now.year
+        end = now.year + 1
+    else:
+        start = now.year - 1
+        end = now.year
+
+    return f"{start}-{str(end)[-2:]}"
+
+
+def get_season_folder() -> str:
+    """
+    Format OpenFootball:
+    2026-27
+    """
+
+    return get_current_season()
+
+
+def openfootball_url(league_code: str) -> str:
+    league = LEAGUES.get(league_code)
+
+    if not league:
         raise ValueError(
-            f"Ligue inconnue: {league_code}"
+            f"Ligue OpenFootball inconnue: {league_code}"
         )
 
-    now = time.time()
+    season = get_season_folder()
 
-    cached = _openfootball_cache.get(
-        league_code
+    return (
+        f"{OPENFOOTBALL_BASE}/"
+        f"{season}/"
+        f"{league['file']}"
     )
 
-    if cached:
 
-        if now - cached["timestamp"] < CACHE_TTL:
+def fetch_openfootball(league_code: str) -> Dict[str, Any]:
+    """
+    Télécharge un fichier OpenFootball.
+    """
 
-            return cached["data"]
-
-    filename = LEAGUES[
-        league_code
-    ]["file"]
-
-    url = (
-        f"{OPENFOOTBALL_BASE}/{filename}"
-    )
+    url = openfootball_url(league_code)
 
     log.info(
-        "Téléchargement OpenFootball: %s",
+        "OpenFootball GET %s",
         url,
     )
 
     response = requests.get(
         url,
         timeout=REQUEST_TIMEOUT,
+        headers={
+            "User-Agent": "GAGNE-TEMPS/1.0",
+            "Accept": "application/json",
+        },
     )
 
     response.raise_for_status()
 
     data = response.json()
 
-    _openfootball_cache[
-        league_code
-    ] = {
-        "timestamp": now,
-        "data": data,
-    }
-
     return data
 
 
-# ============================================================
-# EXTRACTION DES MATCHS
-# ============================================================
+def extract_matches(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    OpenFootball peut utiliser:
+        {"matches": [...]}
 
-def extract_matches(
-    data: dict[str, Any],
-) -> list[dict[str, Any]]:
+    ou:
+        {"rounds": [{"matches": [...]}]}
+    """
 
-    matches: list[dict[str, Any]] = []
+    matches = []
 
-    # --------------------------------------------------------
-    # Format 1:
-    # {
-    #   "matches": [...]
-    # }
-    # --------------------------------------------------------
+    # Format direct
+    if isinstance(data, dict):
+        direct = data.get("matches")
 
-    if isinstance(
-        data.get("matches"),
-        list,
-    ):
+        if isinstance(direct, list):
+            matches.extend(direct)
 
-        matches.extend(
-            data["matches"]
-        )
+    # Format rounds
+    if isinstance(data, dict):
+        rounds = data.get("rounds")
 
-    # --------------------------------------------------------
-    # Format 2:
-    # {
-    #   "rounds": [
-    #       {
-    #          "matches": [...]
-    #       }
-    #   ]
-    # }
-    # --------------------------------------------------------
+        if isinstance(rounds, list):
 
-    rounds = data.get(
-        "rounds",
-        [],
-    )
+            for round_data in rounds:
 
-    if isinstance(
-        rounds,
-        list,
-    ):
+                if not isinstance(round_data, dict):
+                    continue
 
-        for round_data in rounds:
+                round_matches = round_data.get("matches", [])
 
-            if not isinstance(
-                round_data,
-                dict,
-            ):
-                continue
+                if isinstance(round_matches, list):
 
-            round_matches = round_data.get(
-                "matches",
-                [],
-            )
+                    for match in round_matches:
 
-            if not isinstance(
-                round_matches,
-                list,
-            ):
-                continue
+                        if not isinstance(match, dict):
+                            continue
 
-            for match in round_matches:
+                        # Conserve le numéro de journée
+                        if "round" not in match:
+                            match["round"] = round_data.get(
+                                "name",
+                                round_data.get("round"),
+                            )
 
-                match_copy = dict(match)
-
-                if "round" not in match_copy:
-
-                    match_copy[
-                        "round"
-                    ] = round_data.get(
-                        "name",
-                        round_data.get(
-                            "round"
-                        ),
-                    )
-
-                matches.append(
-                    match_copy
-                )
+                        matches.append(match)
 
     return matches
 
 
-# ============================================================
-# DATE MATCH
-# ============================================================
+def parse_round_number(value: Any) -> Optional[int]:
+    """
+    Exemples:
+    Matchday 4 -> 4
+    4 -> 4
+    MD4 -> 4
+    """
 
-def parse_match_date(
-    match: dict[str, Any],
-) -> Optional[date]:
+    if value is None:
+        return None
 
-    raw_date = match.get(
-        "date"
-    )
+    text = str(value).strip()
 
-    if not raw_date:
+    digits = ""
+
+    for char in text:
+        if char.isdigit():
+            digits += char
+
+    if not digits:
         return None
 
     try:
-
-        return datetime.strptime(
-            str(raw_date)[:10],
-            "%Y-%m-%d",
-        ).date()
-
-    except ValueError:
-
+        return int(digits)
+    except Exception:
         return None
 
 
-# ============================================================
-# WEEK / JOURNEE
-# ============================================================
-
-def parse_week(
-    match: dict[str, Any],
-) -> Optional[int]:
-
-    raw = str(
-        match.get(
-            "round",
-            ""
-        )
-    )
-
-    found = re.search(
-        r"(\d+)",
-        raw,
-    )
-
-    if not found:
-        return None
-
-    try:
-        return int(
-            found.group(1)
-        )
-
-    except ValueError:
-        return None
-
-
-# ============================================================
-# RECHERCHE NOM TIKAML
-# ============================================================
-
-def resolve_tikaml_team(
-    openfootball_name: str,
-) -> Optional[str]:
-
-    if not club_predictor:
-        return None
-
-    try:
-
-        club_predictor.load_data()
-
-        df = club_predictor.df
-
-        if df is None:
-            return None
-
-        teams = set(
-            df["home_team"]
-            .dropna()
-            .astype(str)
-            .tolist()
-        )
-
-        teams.update(
-            df["away_team"]
-            .dropna()
-            .astype(str)
-            .tolist()
-        )
-
-        normalized_map = {
-            normalize_team_name(team): team
-            for team in teams
-        }
-
-        candidates = TEAM_ALIASES.get(
-            openfootball_name,
-            [openfootball_name],
-        )
-
-        # Nom direct
-        candidates = [
-            openfootball_name
-        ] + candidates
-
-        for candidate in candidates:
-
-            key = normalize_team_name(
-                candidate
-            )
-
-            if key in normalized_map:
-
-                return normalized_map[key]
-
-        # Comparaison souple
-        source = normalize_team_name(
-            openfootball_name
-        )
-
-        for key, original in normalized_map.items():
-
-            if source == key:
-                return original
-
-            if (
-                source in key
-                or key in source
-            ):
-
-                return original
-
-        return None
-
-    except Exception as exc:
-
-        log.warning(
-            "Erreur résolution équipe %s: %s",
-            openfootball_name,
-            exc,
-        )
-
-        return None
-
-
-# ============================================================
-# FORMATAGE MATCH
-# ============================================================
-
-def format_openfootball_match(
-    match: dict[str, Any],
+def convert_openfootball_match(
+    match: Dict[str, Any],
     league_code: str,
-) -> dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
 
-    return {
+    home = (
+        match.get("team1")
+        or match.get("home")
+        or match.get("home_team")
+    )
+
+    away = (
+        match.get("team2")
+        or match.get("away")
+        or match.get("away_team")
+    )
+
+    date = match.get("date")
+
+    if not home or not away or not date:
+        return None
+
+    score = match.get("score")
+
+    result = {
+        "home_team": str(home),
+        "away_team": str(away),
+        "home_team_tika": normalize_team_name(str(home)),
+        "away_team_tika": normalize_team_name(str(away)),
         "league": league_code,
-
-        "league_name": LEAGUES[
-            league_code
-        ]["name"],
-
-        "country": LEAGUES[
-            league_code
-        ]["country"],
-
-        "round": match.get(
-            "round"
+        "league_name": LEAGUES[league_code]["name"],
+        "date": str(date),
+        "time": match.get("time"),
+        "round": match.get("round"),
+        "week": parse_round_number(match.get("round")),
+        "finished": bool(
+            isinstance(score, dict)
+            and score.get("ft") is not None
         ),
-
-        "date": match.get(
-            "date"
-        ),
-
-        "time": match.get(
-            "time"
-        ),
-
-        "home_team": match.get(
-            "team1",
-            match.get(
-                "homeTeam",
-                ""
-            ),
-        ),
-
-        "away_team": match.get(
-            "team2",
-            match.get(
-                "awayTeam",
-                ""
-            ),
-        ),
-
-        "score": match.get(
-            "score"
-        ),
+        "score": score,
     }
 
+    return result
 
-# ============================================================
-# MATCHS D'UNE DATE
-# ============================================================
 
 def get_matches_for_date(
-    target_date: date,
-) -> tuple[
-    list[dict[str, Any]],
-    dict[str, str],
-]:
+    target_date,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
-    matches = []
-
+    all_matches = []
     source_errors = {}
+
+    date_string = target_date.isoformat()
 
     for league_code in LEAGUES:
 
         try:
 
-            data = fetch_openfootball(
-                league_code
+            data = fetch_openfootball(league_code)
+
+            raw_matches = extract_matches(data)
+
+            log.info(
+                "%s: %d matchs trouvés dans OpenFootball",
+                league_code,
+                len(raw_matches),
             )
 
-            raw_matches = extract_matches(
-                data
-            )
+            for raw in raw_matches:
 
-            for raw_match in raw_matches:
-
-                match_date = parse_match_date(
-                    raw_match
+                match = convert_openfootball_match(
+                    raw,
+                    league_code,
                 )
 
-                if match_date != target_date:
+                if not match:
                     continue
 
-                matches.append(
-                    format_openfootball_match(
-                        raw_match,
-                        league_code,
-                    )
-                )
+                if match["date"] != date_string:
+                    continue
+
+                all_matches.append(match)
 
         except Exception as exc:
 
-            source_errors[
-                league_code
-            ] = str(exc)
+            source_errors[league_code] = str(exc)
 
-    return (
-        matches,
-        source_errors,
+            log.exception(
+                "Erreur OpenFootball %s",
+                league_code,
+            )
+
+    # Tri par heure
+    all_matches.sort(
+        key=lambda x: (
+            x.get("time") or "99:99",
+            x.get("league") or "",
+        )
     )
 
+    return all_matches, source_errors
+
 
 # ============================================================
-# SCORE MATRIX → TOP SCORES
+# TEAM RESOLUTION
 # ============================================================
 
-def score_matrix_to_top_scores(
-    matrix: Any,
-    max_items: int = 5,
-) -> list[dict[str, Any]]:
+def resolve_tika_team(
+    predictor: MatchPredictor,
+    requested_name: str,
+) -> Optional[str]:
 
-    if matrix is None:
-        return []
+    candidates = candidate_team_names(requested_name)
 
     try:
+        df = predictor.df
 
-        arr = np.asarray(
-            matrix,
-            dtype=float,
-        )
+        if df is None:
+            predictor.load_data()
 
-        if arr.ndim != 2:
-            return []
+        df = predictor.df
 
-        items = []
+        if df is None:
+            return None
 
-        for i in range(
-            arr.shape[0]
-        ):
+        teams = set()
 
-            for j in range(
-                arr.shape[1]
-            ):
+        if "home_team" in df.columns:
+            teams.update(
+                str(x)
+                for x in df["home_team"].dropna().unique()
+            )
 
-                probability = float(
-                    arr[i, j]
-                )
+        if "away_team" in df.columns:
+            teams.update(
+                str(x)
+                for x in df["away_team"].dropna().unique()
+            )
 
-                items.append(
-                    {
-                        "home_goals": i,
-                        "away_goals": j,
-                        "score": f"{i}-{j}",
-                        "probability": round(
-                            probability,
-                            4,
-                        ),
-                    }
-                )
+        # Exact
+        for candidate in candidates:
 
-        items.sort(
-            key=lambda x: x[
-                "probability"
-            ],
-            reverse=True,
-        )
+            if candidate in teams:
+                return candidate
 
-        return items[:max_items]
+        # Normalized comparison
+        def normalize_for_compare(value: str) -> str:
+            return (
+                value.lower()
+                .replace(".", "")
+                .replace("-", " ")
+                .replace("_", " ")
+                .strip()
+            )
+
+        normalized_teams = {
+            normalize_for_compare(team): team
+            for team in teams
+        }
+
+        for candidate in candidates:
+
+            key = normalize_for_compare(candidate)
+
+            if key in normalized_teams:
+                return normalized_teams[key]
+
+        # Recherche partielle prudente
+        for candidate in candidates:
+
+            key = normalize_for_compare(candidate)
+
+            for normalized, original in normalized_teams.items():
+
+                if (
+                    key == normalized
+                    or key in normalized
+                    or normalized in key
+                ):
+                    return original
 
     except Exception:
+        log.exception(
+            "Erreur résolution équipe %s",
+            requested_name,
+        )
 
-        return []
+    return None
 
 
 # ============================================================
-# TOP SCORES TIKAML
-# ============================================================
-
-def normalize_top_scores(
-    result: dict[str, Any],
-) -> list[dict[str, Any]]:
-
-    raw = result.get(
-        "top_scores",
-        [],
-    )
-
-    if not raw:
-        raw = result.get(
-            "score_predictions",
-            [],
-        )
-
-    normalized = []
-
-    for item in raw:
-
-        # tuple/list:
-        # (home, away, probability)
-        if isinstance(
-            item,
-            (tuple, list),
-        ):
-
-            if len(item) >= 3:
-
-                try:
-
-                    home_goals = int(
-                        item[0]
-                    )
-
-                    away_goals = int(
-                        item[1]
-                    )
-
-                    probability = normalize_probability(
-                        item[2]
-                    )
-
-                    normalized.append(
-                        {
-                            "home_goals": home_goals,
-                            "away_goals": away_goals,
-                            "score": (
-                                f"{home_goals}-"
-                                f"{away_goals}"
-                            ),
-                            "probability": round(
-                                probability,
-                                4,
-                            ),
-                        }
-                    )
-
-                except Exception:
-                    pass
-
-            continue
-
-        # dict
-        if isinstance(
-            item,
-            dict,
-        ):
-
-            home_goals = item.get(
-                "home_goals",
-                item.get(
-                    "home",
-                    0,
-                ),
-            )
-
-            away_goals = item.get(
-                "away_goals",
-                item.get(
-                    "away",
-                    0,
-                ),
-            )
-
-            probability = item.get(
-                "probability",
-                item.get(
-                    "prob",
-                    0,
-                ),
-            )
-
-            try:
-
-                home_goals = int(
-                    home_goals
-                )
-
-                away_goals = int(
-                    away_goals
-                )
-
-                probability = normalize_probability(
-                    probability
-                )
-
-                normalized.append(
-                    {
-                        "home_goals": home_goals,
-                        "away_goals": away_goals,
-                        "score": (
-                            f"{home_goals}-"
-                            f"{away_goals}"
-                        ),
-                        "probability": round(
-                            probability,
-                            4,
-                        ),
-                    }
-                )
-
-            except Exception:
-                pass
-
-    return normalized[:5]
-
-
-# ============================================================
-# CONVERSION RESULTAT TIKAML
-# ============================================================
-
-def convert_tikaml_prediction(
-    result: dict[str, Any],
-    home_team: str,
-    away_team: str,
-    league: str,
-    match_date: str,
-    kickoff: Optional[str] = None,
-) -> dict[str, Any]:
-
-    probs = result.get(
-        "probs_1x2",
-        [],
-    )
-
-    if len(probs) >= 3:
-
-        home_probability = normalize_probability(
-            probs[0]
-        )
-
-        draw_probability = normalize_probability(
-            probs[1]
-        )
-
-        away_probability = normalize_probability(
-            probs[2]
-        )
-
-    else:
-
-        home_probability = normalize_probability(
-            result.get(
-                "home_probability",
-                result.get(
-                    "home_win",
-                    0,
-                ),
-            )
-        )
-
-        draw_probability = normalize_probability(
-            result.get(
-                "draw_probability",
-                result.get(
-                    "draw",
-                    0,
-                ),
-            )
-        )
-
-        away_probability = normalize_probability(
-            result.get(
-                "away_probability",
-                result.get(
-                    "away_win",
-                    0,
-                ),
-            )
-        )
-
-    lambda_home = safe_float(
-        result.get(
-            "lambda_home",
-            result.get(
-                "expected_home",
-                0,
-            ),
-        )
-    )
-
-    lambda_away = safe_float(
-        result.get(
-            "lambda_away",
-            result.get(
-                "expected_away",
-                0,
-            ),
-        )
-    )
-
-    top_scores = normalize_top_scores(
-        result
-    )
-
-    if not top_scores:
-
-        matrix = result.get(
-            "score_matrix"
-        )
-
-        top_scores = score_matrix_to_top_scores(
-            matrix
-        )
-
-    recommended_score = result.get(
-        "recommended_score"
-    )
-
-    if recommended_score:
-
-        if isinstance(
-            recommended_score,
-            dict,
-        ):
-
-            score_label = recommended_score.get(
-                "label"
-            )
-
-            score_probability = normalize_probability(
-                recommended_score.get(
-                    "prob",
-                    0,
-                )
-            )
-
-        else:
-
-            score_label = str(
-                recommended_score
-            )
-
-            score_probability = 0.0
-
-    else:
-
-        score_label = (
-            top_scores[0]["score"]
-            if top_scores
-            else None
-        )
-
-        score_probability = (
-            top_scores[0]["probability"]
-            if top_scores
-            else 0.0
-        )
-
-    corners_result = result.get(
-        "corners",
-        {},
-    )
-
-    if not corners_result:
-
-        corners_result = {}
-
-    yellows_result = result.get(
-        "yellows",
-        result.get(
-            "cards",
-            {},
-        ),
-    )
-
-    if not yellows_result:
-
-        yellows_result = {}
-
-    corners = {
-        "home": safe_float(
-            corners_result.get(
-                "expected_home",
-                0,
-            )
-        ),
-        "away": safe_float(
-            corners_result.get(
-                "expected_away",
-                0,
-            )
-        ),
-    }
-
-    cards = {
-        "home": safe_float(
-            yellows_result.get(
-                "expected_home",
-                0,
-            )
-        ),
-        "away": safe_float(
-            yellows_result.get(
-                "expected_away",
-                0,
-            )
-        ),
-    }
-
-    selection_input = {
-        "home_team": home_team,
-        "away_team": away_team,
-
-        "probabilities": {
-            "home": home_probability,
-            "draw": draw_probability,
-            "away": away_probability,
-        },
-
-        "lambdas": {
-            "home": lambda_home,
-            "away": lambda_away,
-        },
-
-        "corners": corners,
-
-        "cards": cards,
-
-        "top_scores": top_scores,
-    }
-
-    # ========================================================
-    # MOTEUR GAGNE TEMPS
-    # ========================================================
-
-    selection = select_prediction(
-        selection_input
-    )
-
-    # ========================================================
-    # SORTIE
-    # ========================================================
-
-    return {
-
-        "league": league,
-
-        "league_name": LEAGUES.get(
-            league,
-            {}
-        ).get(
-            "name",
-            league,
-        ),
-
-        "date": match_date,
-
-        "time": kickoff,
-
-        "home_team": home_team,
-
-        "away_team": away_team,
-
-        "model": (
-            "TikaML MatchPredictor"
-        ),
-
-        "version": MODEL_VERSION,
-
-        "probabilities": {
-            "home": percentage(
-                home_probability
-            ),
-            "draw": percentage(
-                draw_probability
-            ),
-            "away": percentage(
-                away_probability
-            ),
-        },
-
-        "lambdas": {
-            "home": round(
-                lambda_home,
-                4,
-            ),
-            "away": round(
-                lambda_away,
-                4,
-            ),
-        },
-
-        "recommended_score": {
-            "score": score_label,
-            "probability": percentage(
-                score_probability
-            ),
-        },
-
-        "top_scores": top_scores,
-
-        "corners": corners,
-
-        "cards": cards,
-
-        "gagne_temps": selection,
-
-        "raw_model": {
-            "score_matrix": result.get(
-                "score_matrix"
-            ),
-        },
-    }
-
-
-# ============================================================
-# PREDICTION D'UN MATCH
+# TIKAML PREDICTION
 # ============================================================
 
 def predict_match(
-    match: dict[str, Any],
-) -> dict[str, Any]:
+    match: Dict[str, Any],
+) -> Dict[str, Any]:
 
-    if club_predictor is None:
+    predictor = load_predictor()
 
+    if predictor is None:
         raise RuntimeError(
-            "TikaML predictor not loaded"
+            predictor_error
+            or "TikaML predictor unavailable"
         )
 
-    openfootball_home = match[
-        "home_team"
-    ]
+    home_open = match["home_team"]
+    away_open = match["away_team"]
 
-    openfootball_away = match[
-        "away_team"
-    ]
-
-    league = match[
-        "league"
-    ]
-
-    match_date = match[
-        "date"
-    ]
-
-    kickoff = match.get(
-        "time"
+    home_tika = resolve_tika_team(
+        predictor,
+        home_open,
     )
 
-    home_tika = resolve_tikaml_team(
-        openfootball_home
-    )
-
-    away_tika = resolve_tikaml_team(
-        openfootball_away
+    away_tika = resolve_tika_team(
+        predictor,
+        away_open,
     )
 
     if not home_tika:
-
         raise ValueError(
-            "Équipe introuvable dans TikaML: "
-            f"{openfootball_home}"
+            f"Équipe introuvable dans TikaML: {home_open}"
         )
 
     if not away_tika:
-
         raise ValueError(
-            "Équipe introuvable dans TikaML: "
-            f"{openfootball_away}"
+            f"Équipe introuvable dans TikaML: {away_open}"
         )
 
-    week = parse_week(
-        match
-    )
+    league = match["league"]
 
-    normalized_season = current_season()
+    season = get_current_season()
+
+    match_date = match["date"]
+
+    week = match.get("week")
 
     log.info(
-        "Prediction: %s vs %s | %s | %s",
+        "Prediction TikaML: %s vs %s | %s | %s",
         home_tika,
         away_tika,
         league,
         match_date,
     )
 
-    # ========================================================
-    # TIKAML
-    # ========================================================
-
-    result = club_predictor.predict(
+    result = predictor.predict(
         home_team=home_tika,
         away_team=away_tika,
         league=league,
-        season=normalized_season,
+        season=season,
         match_date=match_date,
         week=week,
         max_goals=MAX_GOALS,
         odds=None,
     )
 
-    # ========================================================
-    # CONVERSION + SELECTION ENGINE
-    # ========================================================
-
     converted = convert_tikaml_prediction(
-        result=result,
-        home_team=openfootball_home,
-        away_team=openfootball_away,
-        league=league,
-        match_date=match_date,
-        kickoff=kickoff,
+        result,
+        match,
+        home_tika,
+        away_tika,
     )
 
-    # Garder les noms TikaML pour diagnostic
-    converted[
-        "tikaml_teams"
-    ] = {
-        "home": home_tika,
-        "away": away_tika,
+    # Sélection GAGNE TEMPS
+    if select_prediction is not None:
+
+        try:
+            selection = select_prediction(converted)
+
+            converted["gagne_temps"] = json_safe(
+                selection
+            )
+
+        except Exception as exc:
+
+            log.exception(
+                "Erreur Selection Engine: %s",
+                exc,
+            )
+
+            converted["gagne_temps"] = {
+                "status": "unavailable",
+                "error": str(exc),
+            }
+
+    else:
+
+        converted["gagne_temps"] = {
+            "status": "unavailable",
+            "error": "Selection Engine non chargé",
+        }
+
+    return json_safe(converted)
+
+
+# ============================================================
+# CONVERSION TIKAML
+# ============================================================
+
+def normalize_top_scores(
+    top_scores: Any,
+) -> List[Dict[str, Any]]:
+
+    result = []
+
+    if not top_scores:
+        return result
+
+    for item in top_scores:
+
+        try:
+
+            if isinstance(item, dict):
+
+                home_goals = item.get(
+                    "home_goals",
+                    item.get("home"),
+                )
+
+                away_goals = item.get(
+                    "away_goals",
+                    item.get("away"),
+                )
+
+                probability = item.get(
+                    "probability",
+                    item.get("prob", 0),
+                )
+
+            else:
+
+                home_goals = item[0]
+                away_goals = item[1]
+                probability = item[2]
+
+            result.append(
+                {
+                    "home_goals": int(home_goals),
+                    "away_goals": int(away_goals),
+                    "score": f"{int(home_goals)}-{int(away_goals)}",
+                    "probability": float(probability),
+                }
+            )
+
+        except Exception:
+            continue
+
+    return result
+
+
+def normalize_1x2(
+    probs: Any,
+) -> Dict[str, float]:
+
+    try:
+
+        home = float(probs[0])
+        draw = float(probs[1])
+        away = float(probs[2])
+
+    except Exception:
+
+        home = 0.0
+        draw = 0.0
+        away = 0.0
+
+    total = home + draw + away
+
+    if total > 0:
+
+        home /= total
+        draw /= total
+        away /= total
+
+    return {
+        "home": round(home, 6),
+        "draw": round(draw, 6),
+        "away": round(away, 6),
     }
 
-    return converted
+
+def convert_tikaml_prediction(
+    result: Dict[str, Any],
+    match: Dict[str, Any],
+    home_tika: str,
+    away_tika: str,
+) -> Dict[str, Any]:
+
+    probabilities = normalize_1x2(
+        result.get("probs_1x2", [])
+    )
+
+    best_values = [
+        (
+            "home",
+            probabilities["home"],
+        ),
+        (
+            "draw",
+            probabilities["draw"],
+        ),
+        (
+            "away",
+            probabilities["away"],
+        ),
+    ]
+
+    best_pick, best_probability = max(
+        best_values,
+        key=lambda x: x[1],
+    )
+
+    labels = {
+        "home": "1",
+        "draw": "X",
+        "away": "2",
+    }
+
+    outcomes = {
+        "home": "Victoire domicile",
+        "draw": "Match nul",
+        "away": "Victoire extérieur",
+    }
+
+    recommended = result.get(
+        "recommended_score"
+    ) or {}
+
+    top_scores = normalize_top_scores(
+        result.get("top_scores")
+    )
+
+    # Score recommandé
+    recommended_score = {
+        "home_goals": recommended.get(
+            "home_goals"
+        ),
+        "away_goals": recommended.get(
+            "away_goals"
+        ),
+        "score": recommended.get(
+            "label"
+        ),
+        "probability": recommended.get(
+            "prob"
+        ),
+    }
+
+    # Corners
+    corners = result.get("corners")
+
+    if isinstance(corners, dict):
+
+        corners_output = {
+            "lambda_home": corners.get(
+                "lambda_home"
+            ),
+            "lambda_away": corners.get(
+                "lambda_away"
+            ),
+            "total_lambda": (
+                safe_float(corners.get("lambda_home"))
+                + safe_float(corners.get("lambda_away"))
+            ),
+            "over_under": corners.get(
+                "over_under",
+                {},
+            ),
+        }
+
+    else:
+        corners_output = None
+
+    # Cartons
+    yellows = result.get("yellows")
+
+    if isinstance(yellows, dict):
+
+        cards_output = {
+            "lambda_home": yellows.get(
+                "lambda_home"
+            ),
+            "lambda_away": yellows.get(
+                "lambda_away"
+            ),
+            "total_lambda": (
+                safe_float(yellows.get("lambda_home"))
+                + safe_float(yellows.get("lambda_away"))
+            ),
+            "over_under": yellows.get(
+                "over_under",
+                {},
+            ),
+        }
+
+    else:
+        cards_output = None
+
+    output = {
+        "match": {
+            "home_team": match["home_team"],
+            "away_team": match["away_team"],
+            "home_team_tika": home_tika,
+            "away_team_tika": away_tika,
+            "league": match["league"],
+            "league_name": match["league_name"],
+            "date": match["date"],
+            "time": match.get("time"),
+            "round": match.get("round"),
+            "week": match.get("week"),
+        },
+
+        "prediction": {
+            "best_pick": best_pick,
+            "best_pick_label": labels[best_pick],
+            "outcome": outcomes[best_pick],
+            "probability": round(
+                best_probability,
+                6,
+            ),
+
+            "probabilities": probabilities,
+
+            "home_probability": probabilities[
+                "home"
+            ],
+
+            "draw_probability": probabilities[
+                "draw"
+            ],
+
+            "away_probability": probabilities[
+                "away"
+            ],
+        },
+
+        "recommended_score": recommended_score,
+
+        "top_scores": top_scores,
+
+        "goals": {
+            "lambda_home": result.get(
+                "lambda_home"
+            ),
+            "lambda_away": result.get(
+                "lambda_away"
+            ),
+            "over_under": result.get(
+                "goals_over_under",
+                {},
+            ),
+        },
+
+        "corners": corners_output,
+
+        "cards": cards_output,
+
+        "score_groups": result.get(
+            "score_groups",
+            [],
+        ),
+
+        "model": {
+            "name": "TikaML MatchPredictor",
+            "version": MODEL_VERSION,
+            "source": "OpenFootball + TikaML",
+        },
+
+        # Le score_matrix est conservé mais converti
+        # proprement en JSON.
+        "raw_model": {
+            "score_matrix": json_safe(
+                result.get("score_matrix")
+            ),
+        },
+    }
+
+    return json_safe(output)
 
 
 # ============================================================
-# SCORE DE CLASSEMENT GLOBAL
+# UTILITAIRES
 # ============================================================
 
-def ranking_score(
-    prediction: dict[str, Any],
-) -> float:
+def safe_float(value: Any) -> float:
+
+    try:
+
+        if value is None:
+            return 0.0
+
+        value = float(value)
+
+        if math.isnan(value) or math.isinf(value):
+            return 0.0
+
+        return value
+
+    except Exception:
+        return 0.0
+
+
+def selection_summary(
+    prediction: Dict[str, Any],
+) -> Dict[str, Any]:
 
     gagne = prediction.get(
-        "gagne_temps",
+        "gagne_temps"
+    )
+
+    if not isinstance(gagne, dict):
+        return {}
+
+    # On essaie plusieurs structures possibles
+    # afin de rester compatible avec le selection_engine.
+    return {
+        "classification": (
+            gagne.get("classification")
+            or gagne.get("category")
+            or gagne.get("niveau")
+        ),
+
+        "best_market": (
+            gagne.get("best_market")
+            or gagne.get("market")
+            or gagne.get("recommended_market")
+        ),
+
+        "confidence": (
+            gagne.get("confidence")
+            or gagne.get("confidence_index")
+        ),
+
+        "risk": (
+            gagne.get("risk")
+            or gagne.get("risk_level")
+        ),
+    }
+
+
+def ranking_score(
+    prediction: Dict[str, Any],
+) -> float:
+
+    """
+    Classement robuste.
+
+    On privilégie:
+    1. classification
+    2. confiance
+    3. probabilité
+    4. marge entre le meilleur choix et le second
+    """
+
+    classification = (
+        prediction
+        .get("gagne_temps", {})
+        .get("classification")
+    )
+
+    classification_scores = {
+        "PREMIUM": 1000,
+        "BON PRONOSTIC": 700,
+        "RISQUÉ": 400,
+        "À ÉVITER": 0,
+    }
+
+    base = classification_scores.get(
+        str(classification).upper()
+        if classification
+        else "",
+        100,
+    )
+
+    prediction_data = prediction.get(
+        "prediction",
         {},
     )
 
-    global_selection = gagne.get(
-        "global_selection",
+    probability = safe_float(
+        prediction_data.get(
+            "probability"
+        )
+    )
+
+    probs = prediction_data.get(
+        "probabilities",
         {},
     )
 
-    level = global_selection.get(
-        "level",
-        "À ÉVITER",
-    )
+    values = [
+        safe_float(probs.get("home")),
+        safe_float(probs.get("draw")),
+        safe_float(probs.get("away")),
+    ]
+
+    values.sort(reverse=True)
+
+    margin = 0.0
+
+    if len(values) >= 2:
+        margin = max(
+            0.0,
+            values[0] - values[1],
+        )
 
     confidence = safe_float(
-        global_selection.get(
-            "confidence",
-            0,
-        )
-    )
-
-    probability = normalize_probability(
-        global_selection.get(
-            "probability",
-            0,
-        )
-    )
-
-    level_weight = {
-        "PREMIUM": 400,
-        "BON PRONOSTIC": 300,
-        "RISQUÉ": 200,
-        "À ÉVITER": 0,
-    }.get(
-        level,
-        0,
+        prediction
+        .get("gagne_temps", {})
+        .get("confidence")
     )
 
     return (
-        level_weight
-        + confidence
+        base
         + probability * 100
+        + margin * 100
+        + confidence
     )
 
 
 # ============================================================
-# CLASSIFICATION TEXTE
-# ============================================================
-
-def selection_summary(
-    prediction: dict[str, Any],
-) -> dict[str, Any]:
-
-    gagne = prediction.get(
-        "gagne_temps",
-        {},
-    )
-
-    selection = gagne.get(
-        "global_selection",
-        {},
-    )
-
-    return {
-        "level": selection.get(
-            "level",
-            "À ÉVITER",
-        ),
-        "risk": selection.get(
-            "risk",
-            "TRÈS ÉLEVÉ",
-        ),
-        "market": selection.get(
-            "market"
-        ),
-        "selection": selection.get(
-            "selection"
-        ),
-        "probability": selection.get(
-            "probability"
-        ),
-        "confidence": selection.get(
-            "confidence"
-        ),
-    }
-
-
-# ============================================================
-# ROUTE RACINE
+# ROOT
 # ============================================================
 
 @app.get("/")
@@ -1592,15 +1201,14 @@ async def root():
         "predictor_loaded": (
             club_predictor is not None
         ),
-        "source": (
-            "OpenFootball + TikaML"
-        ),
-        "selection_engine": (
-            "selection-engine-1.0"
-        ),
-        "leagues": list(
-            LEAGUES.keys()
-        ),
+        "source": "OpenFootball + TikaML",
+        "routes": {
+            "health": "/health",
+            "today": "/gagne-temps/today",
+            "top": "/gagne-temps/top",
+            "predict": "/gagne-temps/predict",
+            "leagues": "/gagne-temps/leagues",
+        },
     }
 
 
@@ -1611,12 +1219,17 @@ async def root():
 @app.get("/health")
 async def health():
 
+    predictor = load_predictor()
+
     return {
         "status": "ok",
         "service": APP_NAME,
         "version": MODEL_VERSION,
-        "predictor_loaded": (
-            club_predictor is not None
+        "predictor_loaded": predictor is not None,
+        "predictor_error": (
+            predictor_error
+            if predictor is None
+            else None
         ),
     }
 
@@ -1624,15 +1237,22 @@ async def health():
 @app.get("/gagne-temps/health")
 async def gagne_temps_health():
 
+    predictor = load_predictor()
+
     return {
         "status": "ok",
         "service": APP_NAME,
         "version": MODEL_VERSION,
-        "predictor_loaded": (
-            club_predictor is not None
+        "predictor_loaded": predictor is not None,
+        "selection_engine_loaded": (
+            select_prediction is not None
         ),
         "openfootball": True,
-        "selection_engine": True,
+        "predictor_error": (
+            predictor_error
+            if predictor is None
+            else None
+        ),
     }
 
 
@@ -1645,12 +1265,14 @@ async def gagne_temps_leagues():
 
     return {
         "status": "success",
+        "count": len(LEAGUES),
         "leagues": [
             {
                 "code": code,
-                **info,
+                "name": data["name"],
+                "file": data["file"],
             }
-            for code, info in LEAGUES.items()
+            for code, data in LEAGUES.items()
         ],
     }
 
@@ -1667,9 +1289,7 @@ async def gagne_temps_today():
     ).date()
 
     matches, source_errors = (
-        get_matches_for_date(
-            today
-        )
+        get_matches_for_date(today)
     )
 
     return {
@@ -1677,8 +1297,10 @@ async def gagne_temps_today():
         "source": "OpenFootball",
         "date": today.isoformat(),
         "count": len(matches),
-        "matches": matches,
-        "source_errors": source_errors,
+        "matches": json_safe(matches),
+        "source_errors": json_safe(
+            source_errors
+        ),
     }
 
 
@@ -1693,160 +1315,231 @@ async def gagne_temps_top():
         timezone.utc
     ).date()
 
-    matches, source_errors = (
-        get_matches_for_date(
-            today
-        )
+    log.info(
+        "=========================================="
     )
 
-    predictions = []
+    log.info(
+        "GAGNE TEMPS TOP - %s",
+        today.isoformat(),
+    )
 
+    log.info(
+        "=========================================="
+    )
+
+    # --------------------------------------------------------
+    # Récupération OpenFootball
+    # --------------------------------------------------------
+
+    try:
+
+        matches, source_errors = (
+            get_matches_for_date(today)
+        )
+
+    except Exception as exc:
+
+        log.exception(
+            "Erreur globale OpenFootball"
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "error",
+                "source": "OpenFootball",
+                "date": today.isoformat(),
+                "count": 0,
+                "top_5": [],
+                "all_predictions": [],
+                "skipped": [],
+                "source_errors": {
+                    "global": str(exc),
+                },
+            },
+        )
+
+    # --------------------------------------------------------
+    # Analyse match par match
+    # --------------------------------------------------------
+
+    predictions = []
     skipped = []
 
     for match in matches:
 
+        home = match.get(
+            "home_team",
+            "",
+        )
+
+        away = match.get(
+            "away_team",
+            "",
+        )
+
+        league = match.get(
+            "league",
+            "",
+        )
+
         try:
+
+            log.info(
+                "Analyse: %s vs %s [%s]",
+                home,
+                away,
+                league,
+            )
 
             prediction = predict_match(
                 match
             )
 
+            prediction[
+                "selection_summary"
+            ] = selection_summary(
+                prediction
+            )
+
+            internal_score = ranking_score(
+                prediction
+            )
+
+            prediction[
+                "_ranking_score"
+            ] = internal_score
+
             predictions.append(
                 prediction
+            )
+
+            log.info(
+                "OK: %s vs %s | ranking=%.2f",
+                home,
+                away,
+                internal_score,
             )
 
         except Exception as exc:
 
             log.exception(
-                "Match ignoré: %s vs %s",
-                match.get(
-                    "home_team"
-                ),
-                match.get(
-                    "away_team"
-                ),
+                "Erreur prediction: %s vs %s",
+                home,
+                away,
             )
 
             skipped.append(
                 {
-                    "home_team": match.get(
-                        "home_team"
-                    ),
-                    "away_team": match.get(
-                        "away_team"
-                    ),
-                    "league": match.get(
-                        "league"
-                    ),
+                    "home_team": home,
+                    "away_team": away,
+                    "league": league,
                     "reason": str(exc),
+                    "error_type": type(
+                        exc
+                    ).__name__,
                 }
             )
 
-    # ========================================================
-    # CLASSEMENT
-    # ========================================================
+    # --------------------------------------------------------
+    # Classement
+    # --------------------------------------------------------
 
     predictions.sort(
-        key=ranking_score,
+        key=lambda item: safe_float(
+            item.get(
+                "_ranking_score",
+                0,
+            )
+        ),
         reverse=True,
     )
 
-    top_predictions = []
+    # --------------------------------------------------------
+    # Nettoyage du score interne
+    # --------------------------------------------------------
 
     for prediction in predictions:
 
-        prediction[
-            "selection_summary"
-        ] = selection_summary(
-            prediction
+        prediction.pop(
+            "_ranking_score",
+            None,
         )
 
-        top_predictions.append(
-            prediction
-        )
+    # --------------------------------------------------------
+    # Réponse finale
+    # --------------------------------------------------------
 
-    return {
+    response = {
         "status": "success",
-
-        "source": (
-            "OpenFootball + TikaML"
-        ),
-
-        "model": (
-            "TikaML MatchPredictor"
-        ),
-
+        "source": "OpenFootball + TikaML",
+        "model": "TikaML MatchPredictor",
         "selection_engine": (
             "GAGNE TEMPS Selection Engine"
         ),
-
         "version": MODEL_VERSION,
-
         "date": today.isoformat(),
-
-        "count": len(
-            top_predictions
-        ),
-
-        "top_5": top_predictions[:5],
-
-        "all_predictions": top_predictions,
-
+        "count": len(predictions),
+        "top_5": predictions[:5],
+        "all_predictions": predictions,
         "skipped": skipped,
-
         "source_errors": source_errors,
     }
 
-
-# ============================================================
-# PREDICT PUBLIC
-# ============================================================
-
-class PublicPredictionRequest(
-    BaseModel
-):
-
-    league: str = Field(
-        ...,
-        description=(
-            "EPL, LL, SEA, BUN ou LI1"
-        ),
+    # Dernière sécurité JSON
+    safe_response = json_safe(
+        response
     )
 
-    home_team: str
-
-    away_team: str
-
-    match_date: str
-
-    time: Optional[str] = None
+    return JSONResponse(
+        status_code=200,
+        content=safe_response,
+    )
 
 
-@app.post(
-    "/gagne-temps/predict"
-)
+# ============================================================
+# PREDICT BY QUERY
+# ============================================================
+
+@app.get("/gagne-temps/predict")
 async def gagne_temps_predict(
-    request: PublicPredictionRequest,
+    home_team: str,
+    away_team: str,
+    league: str,
+    date: Optional[str] = None,
 ):
 
-    league = request.league.upper()
+    league = league.upper().strip()
 
     if league not in LEAGUES:
 
         raise HTTPException(
             status_code=400,
             detail=(
-                "Ligue invalide. "
-                "Utilisez EPL, LL, SEA, BUN ou LI1."
+                f"Ligue inconnue: {league}. "
+                f"Utilise: "
+                f"{', '.join(LEAGUES.keys())}"
             ),
         )
 
+    if not date:
+
+        date = datetime.now(
+            timezone.utc
+        ).date().isoformat()
+
     match = {
+        "home_team": home_team,
+        "away_team": away_team,
         "league": league,
-        "date": request.match_date,
-        "time": request.time,
-        "home_team": request.home_team,
-        "away_team": request.away_team,
+        "league_name": LEAGUES[
+            league
+        ]["name"],
+        "date": date,
+        "time": None,
+        "round": None,
+        "week": None,
     }
 
     try:
@@ -1855,27 +1548,83 @@ async def gagne_temps_predict(
             match
         )
 
-        prediction[
-            "selection_summary"
-        ] = selection_summary(
-            prediction
+        return JSONResponse(
+            status_code=200,
+            content=json_safe(
+                prediction
+            ),
         )
-
-        return {
-            "status": "success",
-            "prediction": prediction,
-        }
 
     except Exception as exc:
 
         log.exception(
-            "Erreur prediction publique"
+            "Erreur prediction manuelle"
         )
 
         raise HTTPException(
-            status_code=400,
+            status_code=500,
             detail=str(exc),
         )
+
+
+# ============================================================
+# COMPATIBILITY /predict
+# ============================================================
+
+@app.get("/predict")
+async def predict_compat(
+    home_team: str,
+    away_team: str,
+    league: str,
+    date: Optional[str] = None,
+):
+
+    return await gagne_temps_predict(
+        home_team=home_team,
+        away_team=away_team,
+        league=league,
+        date=date,
+    )
+
+
+# ============================================================
+# MODEL STATUS
+# ============================================================
+
+@app.get("/model-status")
+async def model_status():
+
+    predictor = load_predictor()
+
+    if predictor is None:
+
+        return {
+            "status": "error",
+            "loaded": False,
+            "error": predictor_error,
+            "version": MODEL_VERSION,
+        }
+
+    return {
+        "status": "ok",
+        "loaded": True,
+        "version": MODEL_VERSION,
+        "model": (
+            type(
+                predictor.model
+            ).__name__
+            if predictor.model is not None
+            else None
+        ),
+        "corner_model": (
+            predictor.corner_model
+            is not None
+        ),
+        "yellow_model": (
+            predictor.yellow_model
+            is not None
+        ),
+    }
 
 
 # ============================================================
@@ -1883,10 +1632,7 @@ async def gagne_temps_predict(
 # ============================================================
 
 @app.get(
-    "/debug/openfootball/{league_code}",
-    dependencies=[
-        Depends(verify_api_key)
-    ],
+    "/debug/openfootball/{league_code}"
 )
 async def debug_openfootball(
     league_code: str,
@@ -1898,10 +1644,16 @@ async def debug_openfootball(
 
         raise HTTPException(
             status_code=404,
-            detail="Unknown league",
+            detail=(
+                f"Ligue inconnue: {league_code}"
+            ),
         )
 
     try:
+
+        url = openfootball_url(
+            league_code
+        )
 
         data = fetch_openfootball(
             league_code
@@ -1911,349 +1663,89 @@ async def debug_openfootball(
             data
         )
 
+        today = datetime.now(
+            timezone.utc
+        ).date().isoformat()
+
+        today_matches = []
+
+        for raw in matches:
+
+            match = convert_openfootball_match(
+                raw,
+                league_code,
+            )
+
+            if (
+                match
+                and match["date"]
+                == today
+            ):
+                today_matches.append(
+                    match
+                )
+
         return {
             "status": "success",
             "league": league_code,
-            "file": LEAGUES[
-                league_code
-            ]["file"],
-            "count": len(
-                matches
+            "url": url,
+            "season": get_current_season(),
+            "total_matches": len(matches),
+            "today": today,
+            "today_count": len(
+                today_matches
             ),
-            "matches_sample": matches[
-                :10
-            ],
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        )
-
-
-# ============================================================
-# MODEL STATUS
-# ============================================================
-
-@app.get(
-    "/model-status",
-    dependencies=[
-        Depends(verify_api_key)
-    ],
-)
-async def model_status():
-
-    predictor_loaded = (
-        club_predictor is not None
-    )
-
-    goals_loaded = False
-    corners_loaded = False
-    yellows_loaded = False
-
-    if club_predictor:
-
-        goals_loaded = (
-            club_predictor.model
-            is not None
-        )
-
-        corners_loaded = (
-            club_predictor.corner_model
-            is not None
-        )
-
-        yellows_loaded = (
-            club_predictor.yellow_model
-            is not None
-        )
-
-    return {
-        "status": "ok",
-
-        "service": APP_NAME,
-
-        "version": MODEL_VERSION,
-
-        "predictor_loaded": (
-            predictor_loaded
-        ),
-
-        "models_loaded": {
-            "goals": goals_loaded,
-            "corners": corners_loaded,
-            "yellows": yellows_loaded,
-        },
-
-        "selection_engine": {
-            "loaded": True,
-            "version": (
-                "selection-engine-1.0"
+            "today_matches": json_safe(
+                today_matches
             ),
-        },
-    }
-
-
-# ============================================================
-# REQUEST TIKAML ORIGINAL
-# ============================================================
-
-class MatchContext(BaseModel):
-
-    minute: Optional[int] = None
-
-    second: int = 0
-
-    period: Optional[str] = None
-
-    status: Optional[str] = None
-
-    home_score: int = 0
-
-    away_score: int = 0
-
-    home_team_id: Optional[str] = None
-
-    away_team_id: Optional[str] = None
-
-    home_red_cards: int = 0
-
-    away_red_cards: int = 0
-
-    home_corners: int = 0
-
-    away_corners: int = 0
-
-    home_yellows: int = 0
-
-    away_yellows: int = 0
-
-
-class PredictionRequest(BaseModel):
-
-    match_id: int
-
-    opta_match_id: str = ""
-
-    prediction_type: str = "prematch"
-
-    trigger: str = ""
-
-    feature_vector: dict[
-        str,
-        float | int | None
-    ]
-
-    match_context: Optional[
-        MatchContext
-    ] = None
-
-    models: list[str] = Field(
-        default_factory=lambda: [
-            "goals",
-            "corners",
-            "yellows",
-        ]
-    )
-
-
-# ============================================================
-# ROUTE /predict
-# ============================================================
-
-@app.post(
-    "/predict",
-    dependencies=[
-        Depends(verify_api_key)
-    ],
-)
-async def original_predict(
-    request: PredictionRequest,
-):
-
-    if club_predictor is None:
-
-        raise HTTPException(
-            status_code=503,
-            detail="Models not loaded",
-        )
-
-    # Cette route est conservée pour
-    # compatibilité avec TikaML.
-    #
-    # GAGNE TEMPS utilise principalement
-    # /gagne-temps/top et
-    # /gagne-temps/predict.
-
-    try:
-
-        # Construction manuelle avec le modèle
-        # TikaML sous-jacent.
-
-        from src.lgbm_poisson import (
-            LGBMPoissonModel,
-        )
-
-        model = club_predictor.model
-
-        if model is None:
-
-            raise RuntimeError(
-                "Goal model not loaded"
-            )
-
-        feature_cols = (
-            model.feature_cols
-        )
-
-        row = {}
-
-        for column in feature_cols:
-
-            value = request.feature_vector.get(
-                column
-            )
-
-            row[column] = (
-                float(value)
-                if value is not None
-                else np.nan
-            )
-
-        feature_df = pd.DataFrame(
-            [row]
-        )
-
-        lh, la = (
-            model.predict_lambdas(
-                feature_df
-            )
-        )
-
-        lh = float(lh[0])
-        la = float(la[0])
-
-        matrix = (
-            model.predict_score_matrix(
-                lh,
-                la,
-                MAX_GOALS,
-            )
-        )
-
-        p_home = float(
-            np.tril(
-                matrix,
-                -1,
-            ).sum()
-        )
-
-        p_draw = float(
-            np.trace(
-                matrix
-            )
-        )
-
-        p_away = float(
-            np.triu(
-                matrix,
-                1,
-            ).sum()
-        )
-
-        total = (
-            p_home
-            + p_draw
-            + p_away
-        )
-
-        if total > 0:
-
-            p_home /= total
-            p_draw /= total
-            p_away /= total
-
-        best_i, best_j = divmod(
-            int(
-                np.argmax(matrix)
-            ),
-            MAX_GOALS,
-        )
-
-        top_scores = (
-            score_matrix_to_top_scores(
-                matrix
-            )
-        )
-
-        return {
-            "status": "success",
-
-            "predictions": {
-                "goals": {
-                    "home_win": round(
-                        p_home,
-                        4,
-                    ),
-
-                    "draw": round(
-                        p_draw,
-                        4,
-                    ),
-
-                    "away_win": round(
-                        p_away,
-                        4,
-                    ),
-
-                    "expected_home": round(
-                        lh,
-                        4,
-                    ),
-
-                    "expected_away": round(
-                        la,
-                        4,
-                    ),
-
-                    "recommended_score": {
-                        "home_goals": best_i,
-                        "away_goals": best_j,
-                        "prob": round(
-                            float(
-                                matrix[
-                                    best_i,
-                                    best_j,
-                                ]
-                            ),
-                            4,
-                        ),
-                        "label": (
-                            f"{best_i}-{best_j}"
-                        ),
-                    },
-
-                    "top_scores": top_scores,
-                }
-            },
-
-            "model_metadata": {
-                "version": MODEL_VERSION,
-                "prediction_type": (
-                    request.prediction_type
-                ),
-            },
         }
 
     except Exception as exc:
 
         log.exception(
-            "Erreur /predict"
+            "Debug OpenFootball erreur"
         )
 
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "error",
+                "league": league_code,
+                "error": str(exc),
+                "error_type": type(
+                    exc
+                ).__name__,
+            },
         )
+
+
+# ============================================================
+# GLOBAL EXCEPTION HANDLER
+# ============================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(
+    request,
+    exc: Exception,
+):
+
+    log.exception(
+        "Erreur API non gérée: %s",
+        exc,
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "error",
+            "service": APP_NAME,
+            "version": MODEL_VERSION,
+            "error": str(exc),
+            "error_type": type(
+                exc
+            ).__name__,
+            "path": str(
+                request.url.path
+            ),
+        },
+    )
