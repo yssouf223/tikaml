@@ -3,12 +3,17 @@
 FastAPI server that loads trained models and serves predictions
 for the tikaml-data-service.
 
-Also provides the GAGNE TEMPS end-to-end prediction endpoint,
-which builds the required feature vector automatically from
-data/opta/processed/features.csv.
+GAGNE TEMPS:
+- Automatic daily fixtures from API-Football
+- Current standings and form
+- H2H
+- Pre-match 1X2 odds
+- TikaML predictions
+- Confidence/ranking layer
+- TOP 5 daily predictions
 
-Automatic daily fixtures are retrieved from API-Football and
-predicted by the GAGNE TEMPS/TikaML model.
+IMPORTANT:
+API_FOOTBALL_KEY and TIKA_API_KEY must remain server-side.
 """
 
 import json
@@ -32,9 +37,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from scipy.stats import poisson
 
-from src.lgbm_poisson import (
-    LGBMPoissonModel,
-)
+from src.lgbm_poisson import LGBMPoissonModel
 from src.live_predictor import LivePredictor
 from src import national_api
 from src.inference import MatchPredictor
@@ -64,7 +67,6 @@ MAX_GOALS = 7
 # API KEYS
 # ═══════════════════════════════════════════════════════════════════
 
-# Clé utilisée pour protéger l'API TikaML/GAGNE TEMPS
 API_KEY = os.environ.get("TIKA_API_KEY", "")
 
 if not API_KEY:
@@ -75,14 +77,6 @@ if not API_KEY:
     )
 
 
-# Clé API-Football.
-#
-# IMPORTANT :
-# Elle doit uniquement être configurée dans Render
-# sous Environment Variables :
-#
-# API_FOOTBALL_KEY
-#
 API_FOOTBALL_KEY = os.environ.get(
     "API_FOOTBALL_KEY",
     "",
@@ -120,36 +114,31 @@ async def verify_api_key(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# API-FOOTBALL LEAGUES SUPPORTED BY TIKAML
+# SUPPORTED LEAGUES
 # ═══════════════════════════════════════════════════════════════════
 
 SUPPORTED_LEAGUES = {
 
-    # Premier League
     39: {
         "name": "Premier League",
         "tika_code": "EPL",
     },
 
-    # La Liga
     140: {
         "name": "La Liga",
         "tika_code": "LL",
     },
 
-    # Serie A
     135: {
         "name": "Serie A",
         "tika_code": "SEA",
     },
 
-    # Bundesliga
     78: {
         "name": "Bundesliga",
         "tika_code": "BUN",
     },
 
-    # Ligue 1
     61: {
         "name": "Ligue 1",
         "tika_code": "LI1",
@@ -158,7 +147,7 @@ SUPPORTED_LEAGUES = {
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CACHE API-FOOTBALL
+# CACHE
 # ═══════════════════════════════════════════════════════════════════
 
 FIXTURE_CACHE = {
@@ -168,6 +157,18 @@ FIXTURE_CACHE = {
 }
 
 FIXTURE_CACHE_SECONDS = 300
+
+
+DATA_CACHE = {
+    "standings": {},
+    "h2h": {},
+    "odds": {},
+}
+
+
+STANDINGS_CACHE_SECONDS = 3600
+H2H_CACHE_SECONDS = 21600
+ODDS_CACHE_SECONDS = 900
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -186,7 +187,6 @@ class Models:
 
 
 models = Models()
-
 backfill_models = Models()
 
 
@@ -293,7 +293,7 @@ async def lifespan(app: FastAPI):
     t0 = time.time()
 
     # ───────────────────────────────────────────────────────────────
-    # STANDARD GOALS MODEL
+    # GOALS
     # ───────────────────────────────────────────────────────────────
 
     models.goals = LGBMPoissonModel.load(
@@ -336,7 +336,7 @@ async def lifespan(app: FastAPI):
         )
 
     # ───────────────────────────────────────────────────────────────
-    # MODEL VERSION
+    # VERSION
     # ───────────────────────────────────────────────────────────────
 
     meta_path = MODEL_DIR / "meta.json"
@@ -353,22 +353,14 @@ async def lifespan(app: FastAPI):
         )
 
     # ───────────────────────────────────────────────────────────────
-    # BACKFILL MODELS
+    # BACKFILL
     # ───────────────────────────────────────────────────────────────
 
     if BACKFILL_DIR.exists():
 
-        bf_goals_dir = (
-            BACKFILL_DIR / "goals"
-        )
-
-        bf_corners_dir = (
-            BACKFILL_DIR / "corners"
-        )
-
-        bf_yellows_dir = (
-            BACKFILL_DIR / "yellows"
-        )
+        bf_goals_dir = BACKFILL_DIR / "goals"
+        bf_corners_dir = BACKFILL_DIR / "corners"
+        bf_yellows_dir = BACKFILL_DIR / "yellows"
 
         if bf_goals_dir.exists():
 
@@ -422,7 +414,7 @@ async def lifespan(app: FastAPI):
         )
 
     # ───────────────────────────────────────────────────────────────
-    # GAGNE TEMPS MODEL
+    # GAGNE TEMPS
     # ───────────────────────────────────────────────────────────────
 
     try:
@@ -467,7 +459,7 @@ async def lifespan(app: FastAPI):
         )
 
     # ───────────────────────────────────────────────────────────────
-    # API-FOOTBALL STATUS
+    # API-FOOTBALL
     # ───────────────────────────────────────────────────────────────
 
     if API_FOOTBALL_KEY:
@@ -496,12 +488,12 @@ async def lifespan(app: FastAPI):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FASTAPI APPLICATION
+# FASTAPI
 # ═══════════════════════════════════════════════════════════════════
 
 app = FastAPI(
     title="TikaML Prediction Service",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -570,15 +562,17 @@ def _goals_over_under(
 
         ou[str(line)] = {
 
-            "over": round(
-                float(p_over),
-                4,
-            ),
+            "over":
+                round(
+                    float(p_over),
+                    4,
+                ),
 
-            "under": round(
-                float(1 - p_over),
-                4,
-            ),
+            "under":
+                round(
+                    float(1 - p_over),
+                    4,
+                ),
         }
 
     return ou
@@ -603,15 +597,17 @@ def _poisson_over_under(
 
         ou[str(line)] = {
 
-            "over": round(
-                p_over,
-                4,
-            ),
+            "over":
+                round(
+                    p_over,
+                    4,
+                ),
 
-            "under": round(
-                1 - p_over,
-                4,
-            ),
+            "under":
+                round(
+                    1 - p_over,
+                    4,
+                ),
         }
 
     return ou
@@ -635,9 +631,7 @@ def _live_over_under(
         if needed <= 0:
 
             ou[str(line)] = {
-
                 "over": 1.0,
-
                 "under": 0.0,
             }
 
@@ -653,15 +647,17 @@ def _live_over_under(
 
             ou[str(line)] = {
 
-                "over": round(
-                    p_over,
-                    4,
-                ),
+                "over":
+                    round(
+                        p_over,
+                        4,
+                    ),
 
-                "under": round(
-                    1 - p_over,
-                    4,
-                ),
+                "under":
+                    round(
+                        1 - p_over,
+                        4,
+                    ),
             }
 
     return ou
@@ -702,7 +698,6 @@ def predict_prematch(
         )
 
         lh = float(lh[0])
-
         la = float(la[0])
 
         matrix = (
@@ -721,9 +716,7 @@ def predict_prematch(
         )
 
         p_draw = float(
-            np.trace(
-                matrix
-            )
+            np.trace(matrix)
         )
 
         p_away = float(
@@ -742,9 +735,7 @@ def predict_prematch(
         if total > 0:
 
             p_home /= total
-
             p_draw /= total
-
             p_away /= total
 
         score_matrix = [
@@ -868,7 +859,6 @@ def predict_prematch(
         )
 
         clh = float(clh[0])
-
         cla = float(cla[0])
 
         predictions["corners"] = {
@@ -924,7 +914,6 @@ def predict_prematch(
         )
 
         ylh = float(ylh[0])
-
         yla = float(yla[0])
 
         predictions["yellows"] = {
@@ -1000,7 +989,6 @@ def predict_live(
         )
 
         lh = float(lh[0])
-
         la = float(la[0])
 
         lp = LivePredictor(
@@ -1029,13 +1017,9 @@ def predict_live(
             )
         )
 
-        for i in range(
-            MAX_GOALS
-        ):
+        for i in range(MAX_GOALS):
 
-            for j in range(
-                MAX_GOALS
-            ):
+            for j in range(MAX_GOALS):
 
                 ri = (
                     i
@@ -1048,13 +1032,9 @@ def predict_live(
                 )
 
                 if (
-                    0
-                    <= ri
-                    < MAX_GOALS
+                    0 <= ri < MAX_GOALS
                     and
-                    0
-                    <= rj
-                    < MAX_GOALS
+                    0 <= rj < MAX_GOALS
                 ):
 
                     matrix[i, j] = (
@@ -1253,7 +1233,6 @@ def predict_live(
         )
 
         clh = float(clh[0])
-
         cla = float(cla[0])
 
         predictions["corners"] = {
@@ -1321,7 +1300,6 @@ def predict_live(
         )
 
         ylh = float(ylh[0])
-
         yla = float(yla[0])
 
         predictions["yellows"] = {
@@ -1376,17 +1354,14 @@ def predict_live(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# GAGNE TEMPS — TEAM NAME HELPERS
+# TEAM NAME NORMALIZATION
 # ═══════════════════════════════════════════════════════════════════
 
 def _normalize_team_name(
     name: str,
 ) -> str:
 
-    """Normalize a football team name."""
-
     if not name:
-
         return ""
 
     value = unicodedata.normalize(
@@ -1418,15 +1393,80 @@ def _normalize_team_name(
     ).strip()
 
 
+TEAM_ALIASES = {
+
+    "fc schalke 04":
+        "Schalke 04",
+
+    "schalke 04":
+        "Schalke 04",
+
+    "inter milan":
+        "Inter",
+
+    "internazionale":
+        "Inter",
+
+    "fc internazionale milano":
+        "Inter",
+
+    "psg":
+        "Paris Saint-Germain",
+
+    "paris saint germain":
+        "Paris Saint-Germain",
+
+    "paris saint-germain":
+        "Paris Saint-Germain",
+
+    "man united":
+        "Manchester United",
+
+    "manchester united":
+        "Manchester United",
+
+    "man city":
+        "Manchester City",
+
+    "manchester city":
+        "Manchester City",
+
+    "athletic bilbao":
+        "Athletic Club",
+
+    "athletic club":
+        "Athletic Club",
+
+    "club atletico de madrid":
+        "Atletico Madrid",
+
+    "atletico madrid":
+        "Atletico Madrid",
+
+    "real betis balompie":
+        "Real Betis",
+
+    "real betis":
+        "Real Betis",
+
+    "sporting de gijon":
+        "Sporting Gijon",
+
+    "sporting gijon":
+        "Sporting Gijon",
+
+    "paris fc":
+        "Paris FC",
+}
+
+
 def _build_team_index():
 
     """
-    Build a normalized index from all teams
-    contained in features.csv.
+    Build normalized index from features.csv.
     """
 
     if club_predictor is None:
-
         return {}
 
     df = club_predictor.df
@@ -1477,11 +1517,10 @@ def _match_dataset_team(
 ):
 
     """
-    Find the exact team name used by TikaML.
+    Find exact TikaML dataset team.
     """
 
     if not api_team_name:
-
         return None
 
     normalized = (
@@ -1490,14 +1529,33 @@ def _match_dataset_team(
         )
     )
 
-    # Exact normalized match
+    # 1. Exact match
     if normalized in team_index:
 
         return team_index[
             normalized
         ]
 
-    # Common aliases
+    # 2. Explicit alias
+    alias = TEAM_ALIASES.get(
+        normalized
+    )
+
+    if alias:
+
+        alias_norm = (
+            _normalize_team_name(
+                alias
+            )
+        )
+
+        if alias_norm in team_index:
+
+            return team_index[
+                alias_norm
+            ]
+
+    # 3. Legacy aliases
     aliases = {
 
         "inter milan": [
@@ -1530,6 +1588,11 @@ def _match_dataset_team(
             "Paris Saint-Germain",
             "Paris Saint Germain",
         ],
+
+        "fc schalke 04": [
+            "Schalke 04",
+            "FC Schalke 04",
+        ],
     }
 
     if normalized in aliases:
@@ -1544,29 +1607,72 @@ def _match_dataset_team(
                 )
             )
 
-            if (
-                candidate_norm
-                in team_index
-            ):
+            if candidate_norm in team_index:
 
                 return team_index[
                     candidate_norm
                 ]
 
+    # 4. Conservative token matching
+    tokens = set(
+        normalized.split()
+    )
+
+    if tokens:
+
+        candidates = []
+
+        for (
+            team_norm,
+            team_name,
+        ) in team_index.items():
+
+            team_tokens = set(
+                team_norm.split()
+            )
+
+            intersection = (
+                tokens
+                & team_tokens
+            )
+
+            if (
+                len(intersection) >= 2
+                and (
+                    tokens <= team_tokens
+                    or
+                    team_tokens <= tokens
+                )
+            ):
+
+                candidates.append(
+                    (
+                        len(intersection),
+                        team_name,
+                    )
+                )
+
+        if candidates:
+
+            candidates.sort(
+                reverse=True
+            )
+
+            return candidates[0][1]
+
     return None
 
 
 # ═══════════════════════════════════════════════════════════════════
-# API-FOOTBALL
+# API-FOOTBALL GENERIC REQUEST
 # ═══════════════════════════════════════════════════════════════════
 
-def _fetch_api_football_fixtures(
-    fixture_date: str,
+def _api_football_get(
+    endpoint: str,
+    params: dict | None = None,
 ):
-
     """
-    Retrieve fixtures for a specific date
-    from API-Football.
+    Generic API-Football GET helper.
     """
 
     if not API_FOOTBALL_KEY:
@@ -1574,22 +1680,27 @@ def _fetch_api_football_fixtures(
         raise HTTPException(
             status_code=503,
             detail=(
-                "API_FOOTBALL_KEY is not configured "
-                "on the server."
+                "API_FOOTBALL_KEY is not configured."
             ),
         )
 
-    params = urlencode(
+    params = params or {}
+
+    query = urlencode(
         {
-            "date":
-                fixture_date,
+            k: v
+            for k, v in params.items()
+            if v is not None
         }
     )
 
     url = (
-        f"{API_FOOTBALL_URL}/fixtures?"
-        f"{params}"
+        f"{API_FOOTBALL_URL}"
+        f"{endpoint}"
     )
+
+    if query:
+        url += f"?{query}"
 
     request = Request(
         url,
@@ -1597,8 +1708,11 @@ def _fetch_api_football_fixtures(
             "x-apisports-key":
                 API_FOOTBALL_KEY,
 
+            "Accept":
+                "application/json",
+
             "User-Agent":
-                "GAGNE-TEMPS/1.0",
+                "GAGNE-TEMPS/2.0",
         },
         method="GET",
     )
@@ -1621,23 +1735,23 @@ def _fetch_api_football_fixtures(
     except HTTPError as e:
 
         log.error(
-            f"API-Football HTTP error: "
-            f"{e.code}"
+            f"API-Football HTTP "
+            f"{e.code} on {endpoint}"
         )
 
         raise HTTPException(
             status_code=502,
             detail=(
-                f"API-Football returned "
-                f"HTTP {e.code}"
+                f"API-Football HTTP "
+                f"{e.code}"
             ),
         )
 
     except URLError as e:
 
         log.error(
-            f"API-Football connection error: "
-            f"{e}"
+            f"API-Football connection "
+            f"error on {endpoint}: {e}"
         )
 
         raise HTTPException(
@@ -1651,7 +1765,8 @@ def _fetch_api_football_fixtures(
     except Exception as e:
 
         log.exception(
-            "API-Football parsing error"
+            f"API-Football parsing error "
+            f"on {endpoint}"
         )
 
         raise HTTPException(
@@ -1680,11 +1795,27 @@ def _fetch_api_football_fixtures(
     )
 
 
+# ═══════════════════════════════════════════════════════════════════
+# FIXTURES
+# ═══════════════════════════════════════════════════════════════════
+
+def _fetch_api_football_fixtures(
+    fixture_date: str,
+):
+
+    return _api_football_get(
+        "/fixtures",
+        {
+            "date":
+                fixture_date,
+        },
+    )
+
+
 def _get_today_fixture_date():
 
     """
     Mali is UTC+0.
-    Therefore UTC date is the local date in Mali.
     """
 
     return datetime.now(
@@ -1698,25 +1829,20 @@ def _get_cached_fixtures(
     fixture_date: str,
 ):
 
-    """
-    Cache API-Football results for 5 minutes.
-    """
-
     now = time.time()
 
     if (
         FIXTURE_CACHE["date"]
         == fixture_date
 
-        and FIXTURE_CACHE[
-            "fixtures"
-        ] is not None
+        and
+        FIXTURE_CACHE["fixtures"]
+        is not None
 
-        and (
+        and
+        (
             now
-            - FIXTURE_CACHE[
-                "timestamp"
-            ]
+            - FIXTURE_CACHE["timestamp"]
         )
         < FIXTURE_CACHE_SECONDS
     ):
@@ -1747,12 +1873,1095 @@ def _get_cached_fixtures(
 
 
 # ═══════════════════════════════════════════════════════════════════
+# CURRENT STANDINGS
+# ═══════════════════════════════════════════════════════════════════
+
+def _get_current_standings(
+    league_id: int,
+    season: int,
+):
+
+    cache_key = (
+        f"{league_id}:{season}"
+    )
+
+    cached = DATA_CACHE[
+        "standings"
+    ].get(cache_key)
+
+    now = time.time()
+
+    if cached:
+
+        if (
+            now
+            - cached["timestamp"]
+        ) < STANDINGS_CACHE_SECONDS:
+
+            return cached["data"]
+
+    data = _api_football_get(
+        "/standings",
+        {
+            "league":
+                league_id,
+
+            "season":
+                season,
+        },
+    )
+
+    DATA_CACHE[
+        "standings"
+    ][cache_key] = {
+
+        "timestamp":
+            now,
+
+        "data":
+            data,
+    }
+
+    return data
+
+
+def _extract_team_standing(
+    standings_response,
+    team_id: int | None,
+    team_name: str | None = None,
+):
+
+    if not standings_response:
+
+        return None
+
+    normalized_name = (
+        _normalize_team_name(
+            team_name or ""
+        )
+    )
+
+    for block in standings_response:
+
+        league = block.get(
+            "league",
+            {}
+        )
+
+        standings_groups = (
+            league.get(
+                "standings",
+                []
+            )
+        )
+
+        for group in standings_groups:
+
+            for row in group:
+
+                team = row.get(
+                    "team",
+                    {}
+                )
+
+                api_id = team.get(
+                    "id"
+                )
+
+                api_name = team.get(
+                    "name",
+                    ""
+                )
+
+                if (
+                    team_id is not None
+                    and
+                    api_id == team_id
+                ):
+
+                    return row
+
+                if (
+                    normalized_name
+                    and
+                    _normalize_team_name(
+                        api_name
+                    )
+                    == normalized_name
+                ):
+
+                    return row
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# H2H
+# ═══════════════════════════════════════════════════════════════════
+
+def _get_h2h(
+    home_id: int,
+    away_id: int,
+):
+
+    cache_key = (
+        f"{home_id}-{away_id}"
+    )
+
+    cached = DATA_CACHE[
+        "h2h"
+    ].get(cache_key)
+
+    now = time.time()
+
+    if cached:
+
+        if (
+            now
+            - cached["timestamp"]
+        ) < H2H_CACHE_SECONDS:
+
+            return cached["data"]
+
+    data = _api_football_get(
+        "/fixtures/headtohead",
+        {
+            "h2h":
+                f"{home_id}-{away_id}",
+
+            "last":
+                10,
+        },
+    )
+
+    DATA_CACHE[
+        "h2h"
+    ][cache_key] = {
+
+        "timestamp":
+            now,
+
+        "data":
+            data,
+    }
+
+    return data
+
+
+def _summarize_h2h(
+    fixtures,
+    home_id: int,
+):
+
+    if not fixtures:
+
+        return {
+
+            "matches":
+                0,
+
+            "home_wins":
+                0,
+
+            "draws":
+                0,
+
+            "away_wins":
+                0,
+
+            "home_goals":
+                0,
+
+            "away_goals":
+                0,
+
+            "home_win_pct":
+                None,
+
+            "draw_pct":
+                None,
+
+            "away_win_pct":
+                None,
+        }
+
+    home_wins = 0
+    draws = 0
+    away_wins = 0
+
+    home_goals = 0
+    away_goals = 0
+
+    for fixture in fixtures:
+
+        teams = fixture.get(
+            "teams",
+            {}
+        )
+
+        goals = fixture.get(
+            "goals",
+            {}
+        )
+
+        h_team_id = (
+            teams.get(
+                "home",
+                {}
+            ).get(
+                "id"
+            )
+        )
+
+        h_goals = goals.get(
+            "home"
+        )
+
+        a_goals = goals.get(
+            "away"
+        )
+
+        if (
+            h_goals is None
+            or
+            a_goals is None
+        ):
+
+            continue
+
+        h_goals = int(
+            h_goals
+        )
+
+        a_goals = int(
+            a_goals
+        )
+
+        if h_team_id == home_id:
+
+            home_goals += h_goals
+            away_goals += a_goals
+
+            if h_goals > a_goals:
+
+                home_wins += 1
+
+            elif h_goals == a_goals:
+
+                draws += 1
+
+            else:
+
+                away_wins += 1
+
+        else:
+
+            home_goals += a_goals
+            away_goals += h_goals
+
+            if a_goals > h_goals:
+
+                home_wins += 1
+
+            elif a_goals == h_goals:
+
+                draws += 1
+
+            else:
+
+                away_wins += 1
+
+    total = (
+        home_wins
+        + draws
+        + away_wins
+    )
+
+    return {
+
+        "matches":
+            total,
+
+        "home_wins":
+            home_wins,
+
+        "draws":
+            draws,
+
+        "away_wins":
+            away_wins,
+
+        "home_goals":
+            home_goals,
+
+        "away_goals":
+            away_goals,
+
+        "home_win_pct":
+            (
+                round(
+                    home_wins / total,
+                    4,
+                )
+                if total
+                else None
+            ),
+
+        "draw_pct":
+            (
+                round(
+                    draws / total,
+                    4,
+                )
+                if total
+                else None
+            ),
+
+        "away_win_pct":
+            (
+                round(
+                    away_wins / total,
+                    4,
+                )
+                if total
+                else None
+            ),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ODDS
+# ═══════════════════════════════════════════════════════════════════
+
+def _get_fixture_odds(
+    fixture_id: int,
+):
+
+    cache_key = str(
+        fixture_id
+    )
+
+    cached = DATA_CACHE[
+        "odds"
+    ].get(cache_key)
+
+    now = time.time()
+
+    if cached:
+
+        if (
+            now
+            - cached["timestamp"]
+        ) < ODDS_CACHE_SECONDS:
+
+            return cached["data"]
+
+    data = _api_football_get(
+        "/odds",
+        {
+            "fixture":
+                fixture_id,
+        },
+    )
+
+    DATA_CACHE[
+        "odds"
+    ][cache_key] = {
+
+        "timestamp":
+            now,
+
+        "data":
+            data,
+    }
+
+    return data
+
+
+def _extract_1x2_odds(
+    odds_response,
+):
+
+    if not odds_response:
+
+        return None
+
+    for bookmaker_block in odds_response:
+
+        bookmakers = (
+            bookmaker_block.get(
+                "bookmakers",
+                []
+            )
+        )
+
+        for bookmaker in bookmakers:
+
+            bets = bookmaker.get(
+                "bets",
+                []
+            )
+
+            for bet in bets:
+
+                bet_name = str(
+                    bet.get(
+                        "name",
+                        ""
+                    )
+                ).lower()
+
+                bet_id = bet.get(
+                    "id"
+                )
+
+                if not (
+                    bet_id == 1
+                    or
+                    "match winner"
+                    in bet_name
+                    or
+                    bet_name == "winner"
+                ):
+
+                    continue
+
+                values = bet.get(
+                    "values",
+                    []
+                )
+
+                home = None
+                draw = None
+                away = None
+
+                for value in values:
+
+                    label = str(
+                        value.get(
+                            "value",
+                            ""
+                        )
+                    ).lower()
+
+                    odd = value.get(
+                        "odd"
+                    )
+
+                    try:
+
+                        odd = float(
+                            odd
+                        )
+
+                    except (
+                        TypeError,
+                        ValueError,
+                    ):
+
+                        continue
+
+                    if label in (
+                        "home",
+                        "1",
+                    ):
+
+                        home = odd
+
+                    elif label in (
+                        "draw",
+                        "x",
+                    ):
+
+                        draw = odd
+
+                    elif label in (
+                        "away",
+                        "2",
+                    ):
+
+                        away = odd
+
+                if (
+                    home
+                    and
+                    draw
+                    and
+                    away
+                ):
+
+                    raw_h = 1 / home
+                    raw_d = 1 / draw
+                    raw_a = 1 / away
+
+                    total = (
+                        raw_h
+                        + raw_d
+                        + raw_a
+                    )
+
+                    return {
+
+                        "home":
+                            home,
+
+                        "draw":
+                            draw,
+
+                        "away":
+                            away,
+
+                        "prob_home":
+                            raw_h / total,
+
+                        "prob_draw":
+                            raw_d / total,
+
+                        "prob_away":
+                            raw_a / total,
+
+                        "bookmaker":
+                            bookmaker.get(
+                                "name"
+                            ),
+                    }
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CONFIDENCE ENGINE
+# ═══════════════════════════════════════════════════════════════════
+
+def _clamp(
+    value: float,
+    minimum: float = 0.0,
+    maximum: float = 100.0,
+):
+
+    return max(
+        minimum,
+        min(
+            maximum,
+            value,
+        ),
+    )
+
+
+def _confidence_label(
+    score: float,
+):
+
+    if score >= 78:
+
+        return "TRÈS FORT"
+
+    if score >= 68:
+
+        return "FORT"
+
+    if score >= 58:
+
+        return "MOYEN"
+
+    return "FAIBLE"
+
+
+def _form_points(
+    form: str,
+):
+
+    value = 0
+
+    for char in (
+        form or ""
+    )[-5:]:
+
+        if char == "W":
+
+            value += 3
+
+        elif char == "D":
+
+            value += 1
+
+    return value
+
+
+def _calculate_confidence(
+    prediction: dict,
+    home_standing: dict | None,
+    away_standing: dict | None,
+    h2h_summary: dict | None,
+    odds: dict | None,
+):
+
+    goals = prediction.get(
+        "goals",
+        {}
+    )
+
+    p_home = float(
+        goals.get(
+            "home_win",
+            0
+        )
+    )
+
+    p_draw = float(
+        goals.get(
+            "draw",
+            0
+        )
+    )
+
+    p_away = float(
+        goals.get(
+            "away_win",
+            0
+        )
+    )
+
+    probs = {
+
+        "home":
+            p_home,
+
+        "draw":
+            p_draw,
+
+        "away":
+            p_away,
+    }
+
+    predicted_side = max(
+        probs,
+        key=probs.get,
+    )
+
+    model_probability = (
+        probs[predicted_side]
+        * 100
+    )
+
+    # Base score.
+    score = (
+        45
+        + max(
+            0,
+            model_probability - 33,
+        ) * 0.65
+    )
+
+    evidence = []
+
+    # ─────────────────────────────────────────────────────────────
+    # CURRENT TABLE
+    # ─────────────────────────────────────────────────────────────
+
+    if (
+        home_standing
+        and away_standing
+    ):
+
+        hp = home_standing.get(
+            "points"
+        )
+
+        ap = away_standing.get(
+            "points"
+        )
+
+        if (
+            hp is not None
+            and
+            ap is not None
+        ):
+
+            if (
+                predicted_side == "home"
+                and
+                hp > ap
+            ):
+
+                score += 5
+
+                evidence.append(
+                    "Classement favorable domicile"
+                )
+
+            elif (
+                predicted_side == "away"
+                and
+                ap > hp
+            ):
+
+                score += 5
+
+                evidence.append(
+                    "Classement favorable extérieur"
+                )
+
+    # ─────────────────────────────────────────────────────────────
+    # FORM
+    # ─────────────────────────────────────────────────────────────
+
+    home_form = (
+        home_standing.get(
+            "form"
+        )
+        if home_standing
+        else ""
+    )
+
+    away_form = (
+        away_standing.get(
+            "form"
+        )
+        if away_standing
+        else ""
+    )
+
+    hf = _form_points(
+        home_form
+    )
+
+    af = _form_points(
+        away_form
+    )
+
+    if predicted_side == "home":
+
+        if hf > af:
+
+            score += 7
+
+            evidence.append(
+                "Forme récente favorable"
+            )
+
+    elif predicted_side == "away":
+
+        if af > hf:
+
+            score += 7
+
+            evidence.append(
+                "Forme récente favorable"
+            )
+
+    # ─────────────────────────────────────────────────────────────
+    # H2H
+    # ─────────────────────────────────────────────────────────────
+
+    if h2h_summary:
+
+        h2h_home = (
+            h2h_summary.get(
+                "home_win_pct"
+            )
+        )
+
+        h2h_away = (
+            h2h_summary.get(
+                "away_win_pct"
+            )
+        )
+
+        if predicted_side == "home":
+
+            if (
+                h2h_home is not None
+                and
+                h2h_home >= 0.50
+            ):
+
+                score += 5
+
+                evidence.append(
+                    "H2H favorable"
+                )
+
+        elif predicted_side == "away":
+
+            if (
+                h2h_away is not None
+                and
+                h2h_away >= 0.50
+            ):
+
+                score += 5
+
+                evidence.append(
+                    "H2H favorable"
+                )
+
+    # ─────────────────────────────────────────────────────────────
+    # MARKET AGREEMENT
+    # ─────────────────────────────────────────────────────────────
+
+    market_probability = None
+
+    if odds:
+
+        market_probs = {
+
+            "home":
+                odds.get(
+                    "prob_home"
+                ),
+
+            "draw":
+                odds.get(
+                    "prob_draw"
+                ),
+
+            "away":
+                odds.get(
+                    "prob_away"
+                ),
+        }
+
+        market_probability = (
+            market_probs.get(
+                predicted_side
+            )
+        )
+
+        if (
+            market_probability
+            is not None
+        ):
+
+            difference = abs(
+                (
+                    model_probability
+                    / 100
+                )
+                - market_probability
+            )
+
+            if difference <= 0.05:
+
+                score += 8
+
+                evidence.append(
+                    "Modèle et marché concordants"
+                )
+
+            elif difference <= 0.10:
+
+                score += 3
+
+            elif difference >= 0.18:
+
+                score -= 8
+
+                evidence.append(
+                    "Désaccord important avec le marché"
+                )
+
+    score = _clamp(
+        score
+    )
+
+    return {
+
+        "score":
+            round(
+                score,
+                2,
+            ),
+
+        "level":
+            _confidence_label(
+                score
+            ),
+
+        "predicted_side":
+            predicted_side,
+
+        "model_probability":
+            round(
+                model_probability,
+                2,
+            ),
+
+        "market_probability":
+            (
+                round(
+                    market_probability
+                    * 100,
+                    2,
+                )
+                if market_probability
+                is not None
+                else None
+            ),
+
+        "evidence":
+            evidence[:5],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BEST PICK
+# ═══════════════════════════════════════════════════════════════════
+
+def _build_best_pick(
+    prediction: dict,
+):
+
+    goals = prediction.get(
+        "goals",
+        {}
+    )
+
+    if not goals:
+
+        return None
+
+    candidates = []
+
+    home = float(
+        goals.get(
+            "home_win",
+            0
+        )
+    )
+
+    draw = float(
+        goals.get(
+            "draw",
+            0
+        )
+    )
+
+    away = float(
+        goals.get(
+            "away_win",
+            0
+        )
+    )
+
+    candidates.extend([
+
+        {
+            "market":
+                "1",
+
+            "probability":
+                home,
+
+            "label":
+                "Victoire domicile",
+        },
+
+        {
+            "market":
+                "X",
+
+            "probability":
+                draw,
+
+            "label":
+                "Match nul",
+        },
+
+        {
+            "market":
+                "2",
+
+            "probability":
+                away,
+
+            "label":
+                "Victoire extérieur",
+        },
+    ])
+
+    ou = goals.get(
+        "over_under",
+        {}
+    )
+
+    for line in (
+        "1.5",
+        "2.5",
+        "3.5",
+    ):
+
+        if line not in ou:
+            continue
+
+        over = float(
+            ou[line].get(
+                "over",
+                0
+            )
+        )
+
+        under = float(
+            ou[line].get(
+                "under",
+                0
+            )
+        )
+
+        candidates.append({
+
+            "market":
+                f"Over {line}",
+
+            "probability":
+                over,
+
+            "label":
+                f"Plus de {line} buts",
+        })
+
+        candidates.append({
+
+            "market":
+                f"Under {line}",
+
+            "probability":
+                under,
+
+            "label":
+                f"Moins de {line} buts",
+        })
+
+    candidates.sort(
+        key=lambda x:
+            x["probability"],
+        reverse=True,
+    )
+
+    best = candidates[0]
+
+    return {
+
+        "market":
+            best["market"],
+
+        "label":
+            best["label"],
+
+        "probability":
+            round(
+                best["probability"]
+                * 100,
+                2,
+            ),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # JSON CLEANER
 # ═══════════════════════════════════════════════════════════════════
 
 def _clean_json(obj):
-
-    """Convert NumPy/Pandas values to JSON-safe values."""
 
     if isinstance(
         obj,
@@ -1852,34 +3061,16 @@ async def gagne_temps_predict(
     req: GagneTempsRequest,
 ):
 
-    """
-    GAGNE TEMPS end-to-end prediction.
-
-    User supplies:
-
-    - home_team
-    - away_team
-    - league
-    - season
-    - match_date
-    - optional week
-
-    TikaML automatically builds the feature
-    vector from features.csv.
-    """
-
     if club_predictor is None:
 
         raise HTTPException(
             status_code=503,
             detail=(
                 "GAGNE TEMPS predictor is not loaded. "
-                "Check data/opta/processed/features.csv "
-                "and the model files."
+                "Check features.csv and model files."
             ),
         )
 
-    # Validate date
     try:
 
         match_date = pd.Timestamp(
@@ -1896,7 +3087,6 @@ async def gagne_temps_predict(
             ),
         )
 
-    # Normalize
     home_team = (
         req.home_team.strip()
     )
@@ -1913,7 +3103,11 @@ async def gagne_temps_predict(
         req.season.strip()
     )
 
-    if not home_team or not away_team:
+    if (
+        not home_team
+        or
+        not away_team
+    ):
 
         raise HTTPException(
             status_code=400,
@@ -1936,7 +3130,6 @@ async def gagne_temps_predict(
             ),
         )
 
-    # Dataset validation
     df = club_predictor.df
 
     known_home = (
@@ -1961,9 +3154,7 @@ async def gagne_temps_predict(
             status_code=400,
             detail=(
                 f"Unknown home team: "
-                f"{home_team}. "
-                "Team name must match "
-                "features.csv."
+                f"{home_team}."
             ),
         )
 
@@ -1973,13 +3164,10 @@ async def gagne_temps_predict(
             status_code=400,
             detail=(
                 f"Unknown away team: "
-                f"{away_team}. "
-                "Team name must match "
-                "features.csv."
+                f"{away_team}."
             ),
         )
 
-    # Prediction
     t0 = time.time()
 
     result = club_predictor.predict(
@@ -2002,14 +3190,6 @@ async def gagne_temps_predict(
 
     result = _clean_json(
         result
-    )
-
-    log.info(
-        f"GAGNE TEMPS "
-        f"{home_team} vs {away_team} "
-        f"league={league} "
-        f"season={season} "
-        f"elapsed={elapsed}ms"
     )
 
     return {
@@ -2059,7 +3239,7 @@ async def gagne_temps_predict(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# GAGNE TEMPS — AUTOMATIC TODAY
+# GAGNE TEMPS — AUTOMATIC TODAY V2
 # ═══════════════════════════════════════════════════════════════════
 
 @app.get(
@@ -2069,11 +3249,6 @@ async def gagne_temps_predict(
     ],
 )
 async def gagne_temps_today():
-
-    """
-    Automatically retrieves today's fixtures from API-Football
-    and predicts supported matches using GAGNE TEMPS/TikaML.
-    """
 
     if club_predictor is None:
 
@@ -2110,7 +3285,6 @@ async def gagne_temps_today():
     )
 
     results = []
-
     skipped = []
 
     for fixture in fixtures:
@@ -2119,16 +3293,13 @@ async def gagne_temps_today():
 
             league_data = fixture.get(
                 "league",
-                {},
+                {}
             )
 
-            league_id = (
-                league_data.get(
-                    "id"
-                )
+            league_id = league_data.get(
+                "id"
             )
 
-            # Only leagues supported by TikaML
             if (
                 league_id
                 not in SUPPORTED_LEAGUES
@@ -2142,31 +3313,50 @@ async def gagne_temps_today():
                 ]
             )
 
+            fixture_info = fixture.get(
+                "fixture",
+                {}
+            )
+
+            fixture_id = fixture_info.get(
+                "id"
+            )
+
             teams = fixture.get(
                 "teams",
-                {},
+                {}
             )
 
-            home_api = (
-                teams.get(
-                    "home",
-                    {},
-                ).get(
-                    "name"
-                )
+            home_obj = teams.get(
+                "home",
+                {}
             )
 
-            away_api = (
-                teams.get(
-                    "away",
-                    {},
-                ).get(
-                    "name"
-                )
+            away_obj = teams.get(
+                "away",
+                {}
             )
 
-            # Match API-Football names
-            # against TikaML dataset names
+            home_api = home_obj.get(
+                "name"
+            )
+
+            away_api = away_obj.get(
+                "name"
+            )
+
+            home_api_id = home_obj.get(
+                "id"
+            )
+
+            away_api_id = away_obj.get(
+                "id"
+            )
+
+            # ─────────────────────────────────────────────────────
+            # TEAM MATCHING
+            # ─────────────────────────────────────────────────────
+
             home_team = (
                 _match_dataset_team(
                     home_api,
@@ -2183,18 +3373,14 @@ async def gagne_temps_today():
 
             if (
                 not home_team
-                or not away_team
+                or
+                not away_team
             ):
 
                 skipped.append({
 
                     "fixture_id":
-                        fixture.get(
-                            "fixture",
-                            {},
-                        ).get(
-                            "id"
-                        ),
+                        fixture_id,
 
                     "home_team":
                         home_api,
@@ -2214,71 +3400,145 @@ async def gagne_temps_today():
 
                 continue
 
-            fixture_info = (
-                fixture.get(
-                    "fixture",
-                    {},
-                )
+            # ─────────────────────────────────────────────────────
+            # DATE
+            # ─────────────────────────────────────────────────────
+
+            date_time = fixture_info.get(
+                "date"
             )
 
-            date_time = (
-                fixture_info.get(
-                    "date"
-                )
+            match_date = (
+                date_time[:10]
+                if date_time
+                else fixture_date
             )
 
-            if date_time:
+            # ─────────────────────────────────────────────────────
+            # WEEK
+            # ─────────────────────────────────────────────────────
 
-                match_date = (
-                    date_time[:10]
-                )
-
-            else:
-
-                match_date = (
-                    fixture_date
-                )
-
-            # Extract week/round
-            round_name = (
-                league_data.get(
-                    "round"
-                )
+            round_name = league_data.get(
+                "round"
             )
 
             week_number = None
 
             if round_name:
 
-                match = re.search(
+                round_match = re.search(
                     r"(\d+)",
-                    str(
-                        round_name
-                    ),
+                    str(round_name),
                 )
 
-                if match:
+                if round_match:
 
                     week_number = int(
-                        match.group(1)
+                        round_match.group(1)
                     )
 
-            # API-Football season
-            api_season = (
-                league_data.get(
-                    "season"
-                )
+            # ─────────────────────────────────────────────────────
+            # SEASON
+            # ─────────────────────────────────────────────────────
+
+            api_season = league_data.get(
+                "season"
             )
 
             if api_season is None:
 
-                api_season = (
-                    datetime.now(
-                        timezone.utc
-                    ).year
+                api_season = datetime.now(
+                    timezone.utc
+                ).year
+
+            # ─────────────────────────────────────────────────────
+            # STANDINGS
+            # ─────────────────────────────────────────────────────
+
+            standings_response = (
+                _get_current_standings(
+                    league_id,
+                    int(api_season),
+                )
+            )
+
+            home_standing = (
+                _extract_team_standing(
+                    standings_response,
+                    home_api_id,
+                    home_api,
+                )
+            )
+
+            away_standing = (
+                _extract_team_standing(
+                    standings_response,
+                    away_api_id,
+                    away_api,
+                )
+            )
+
+            # ─────────────────────────────────────────────────────
+            # H2H
+            # ─────────────────────────────────────────────────────
+
+            h2h_summary = None
+
+            if (
+                home_api_id
+                and
+                away_api_id
+            ):
+
+                h2h_response = (
+                    _get_h2h(
+                        home_api_id,
+                        away_api_id,
+                    )
                 )
 
-            # Run TikaML
+                h2h_summary = (
+                    _summarize_h2h(
+                        h2h_response,
+                        home_api_id,
+                    )
+                )
+
+            # ─────────────────────────────────────────────────────
+            # ODDS
+            # ─────────────────────────────────────────────────────
+
+            odds = None
+
+            if fixture_id:
+
+                try:
+
+                    odds_response = (
+                        _get_fixture_odds(
+                            fixture_id
+                        )
+                    )
+
+                    odds = (
+                        _extract_1x2_odds(
+                            odds_response
+                        )
+                    )
+
+                except Exception as odds_error:
+
+                    log.warning(
+                        f"Odds unavailable "
+                        f"for fixture "
+                        f"{fixture_id}: "
+                        f"{odds_error}"
+                    )
+
+            # ─────────────────────────────────────────────────────
+            # TIKAML
+            # ─────────────────────────────────────────────────────
+
             t0 = time.time()
 
             prediction = (
@@ -2297,6 +3557,7 @@ async def gagne_temps_today():
                         match_date
                     ),
                     week=week_number,
+                    odds=odds,
                 )
             )
 
@@ -2304,8 +3565,7 @@ async def gagne_temps_today():
                 (
                     time.time()
                     - t0
-                )
-                * 1000,
+                ) * 1000,
                 1,
             )
 
@@ -2313,12 +3573,145 @@ async def gagne_temps_today():
                 prediction
             )
 
+            # ─────────────────────────────────────────────────────
+            # BEST PICK
+            # ─────────────────────────────────────────────────────
+
+            best_pick = (
+                _build_best_pick(
+                    prediction
+                )
+            )
+
+            # ─────────────────────────────────────────────────────
+            # CONFIDENCE
+            # ─────────────────────────────────────────────────────
+
+            confidence = (
+                _calculate_confidence(
+                    prediction,
+                    home_standing,
+                    away_standing,
+                    h2h_summary,
+                    odds,
+                )
+            )
+
+            # ─────────────────────────────────────────────────────
+            # CURRENT FORM
+            # ─────────────────────────────────────────────────────
+
+            home_form = (
+                home_standing.get(
+                    "form"
+                )
+                if home_standing
+                else None
+            )
+
+            away_form = (
+                away_standing.get(
+                    "form"
+                )
+                if away_standing
+                else None
+            )
+
+            # ─────────────────────────────────────────────────────
+            # CURRENT TABLE
+            # ─────────────────────────────────────────────────────
+
+            table_context = {
+
+                "home": {
+
+                    "rank":
+                        (
+                            home_standing.get(
+                                "rank"
+                            )
+                            if home_standing
+                            else None
+                        ),
+
+                    "points":
+                        (
+                            home_standing.get(
+                                "points"
+                            )
+                            if home_standing
+                            else None
+                        ),
+
+                    "goals_diff":
+                        (
+                            home_standing.get(
+                                "goalsDiff"
+                            )
+                            if home_standing
+                            else None
+                        ),
+
+                    "form":
+                        home_form,
+
+                    "home_record":
+                        (
+                            home_standing.get(
+                                "home"
+                            )
+                            if home_standing
+                            else None
+                        ),
+                },
+
+                "away": {
+
+                    "rank":
+                        (
+                            away_standing.get(
+                                "rank"
+                            )
+                            if away_standing
+                            else None
+                        ),
+
+                    "points":
+                        (
+                            away_standing.get(
+                                "points"
+                            )
+                            if away_standing
+                            else None
+                        ),
+
+                    "goals_diff":
+                        (
+                            away_standing.get(
+                                "goalsDiff"
+                            )
+                            if away_standing
+                            else None
+                        ),
+
+                    "form":
+                        away_form,
+
+                    "away_record":
+                        (
+                            away_standing.get(
+                                "away"
+                            )
+                            if away_standing
+                            else None
+                        ),
+                },
+            }
+
             results.append({
 
                 "fixture_id":
-                    fixture_info.get(
-                        "id"
-                    ),
+                    fixture_id,
 
                 "status":
                     fixture_info.get(
@@ -2373,6 +3766,24 @@ async def gagne_temps_today():
                 "prediction":
                     prediction,
 
+                "best_pick":
+                    best_pick,
+
+                "confidence":
+                    confidence,
+
+                "current_context": {
+
+                    "standings":
+                        table_context,
+
+                    "h2h":
+                        h2h_summary,
+
+                    "odds":
+                        odds,
+                },
+
                 "model_metadata": {
 
                     "engine":
@@ -2383,6 +3794,9 @@ async def gagne_temps_today():
 
                     "source":
                         "API-Football + TikaML",
+
+                    "live_context":
+                        True,
 
                     "elapsed_ms":
                         elapsed,
@@ -2432,7 +3846,81 @@ async def gagne_temps_today():
                     str(e),
             })
 
-    return {
+    # ═════════════════════════════════════════════════════════════
+    # SORT
+    # ═════════════════════════════════════════════════════════════
+
+    results.sort(
+        key=lambda item:
+            item.get(
+                "confidence",
+                {}
+            ).get(
+                "score",
+                0
+            ),
+        reverse=True,
+    )
+
+    # ═════════════════════════════════════════════════════════════
+    # TOP 5
+    # ═════════════════════════════════════════════════════════════
+
+    top5 = []
+
+    for rank, item in enumerate(
+        results[:5],
+        start=1,
+    ):
+
+        top5.append({
+
+            "rank":
+                rank,
+
+            "fixture_id":
+                item.get(
+                    "fixture_id"
+                ),
+
+            "match":
+                item.get(
+                    "match"
+                ),
+
+            "league":
+                item.get(
+                    "league"
+                ),
+
+            "kickoff":
+                item.get(
+                    "kickoff"
+                ),
+
+            "best_pick":
+                item.get(
+                    "best_pick"
+                ),
+
+            "confidence":
+                item.get(
+                    "confidence"
+                ),
+
+            "recommended_score":
+                item.get(
+                    "prediction",
+                    {}
+                ).get(
+                    "goals",
+                    {}
+                ).get(
+                    "recommended_score"
+                ),
+        })
+
+    return _clean_json({
 
         "status":
             "success",
@@ -2441,17 +3929,17 @@ async def gagne_temps_today():
             fixture_date,
 
         "source":
-            "API-Football",
+            "API-Football + TikaML",
 
         "model":
             "TikaML MatchPredictor",
 
+        "version":
+            models.version,
+
         "supported_leagues":
             [
-                league[
-                    "name"
-                ]
-
+                league["name"]
                 for league
                 in SUPPORTED_LEAGUES.values()
             ],
@@ -2465,11 +3953,68 @@ async def gagne_temps_today():
         "skipped_count":
             len(skipped),
 
+        "top_5":
+            top5,
+
         "predictions":
             results,
 
         "skipped":
             skipped,
+
+        "disclaimer":
+            (
+                "Predictions are statistical estimates "
+                "and are not guarantees."
+            ),
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GAGNE TEMPS — TOP 5
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get(
+    "/gagne-temps/top",
+    dependencies=[
+        Depends(verify_api_key)
+    ],
+)
+async def gagne_temps_top():
+
+    """
+    Lightweight endpoint for the mobile application.
+    """
+
+    data = await gagne_temps_today()
+
+    return {
+
+        "status":
+            data["status"],
+
+        "date":
+            data["date"],
+
+        "source":
+            data["source"],
+
+        "model":
+            data["model"],
+
+        "version":
+            data["version"],
+
+        "count":
+            len(
+                data["top_5"]
+            ),
+
+        "top_5":
+            data["top_5"],
+
+        "disclaimer":
+            data["disclaimer"],
     }
 
 
@@ -2488,8 +4033,6 @@ async def predict(
     req: PredictionRequest,
 ):
 
-    """Main prediction endpoint."""
-
     if models.goals is None:
 
         raise HTTPException(
@@ -2503,7 +4046,8 @@ async def predict(
         req.prediction_type
         == "live"
 
-        and req.match_context
+        and
+        req.match_context
     ):
 
         predictions = predict_live(
@@ -2570,8 +4114,6 @@ async def backfill(
     req: PredictionRequest,
 ):
 
-    """Backfill prediction endpoint."""
-
     if backfill_models.goals is None:
 
         raise HTTPException(
@@ -2632,8 +4174,6 @@ async def backfill(
 )
 async def model_status():
 
-    """Model status check endpoint."""
-
     return {
 
         "status":
@@ -2667,17 +4207,13 @@ async def model_status():
         "gagne_temps": {
 
             "loaded":
-                club_predictor
-                is not None,
+                club_predictor is not None,
 
             "features_loaded":
                 (
-                    club_predictor
-                    is not None
-
+                    club_predictor is not None
                     and
-                    club_predictor.df
-                    is not None
+                    club_predictor.df is not None
                 ),
 
             "historical_matches":
@@ -2685,16 +4221,11 @@ async def model_status():
                     len(
                         club_predictor.df
                     )
-
                     if (
-                        club_predictor
-                        is not None
-
+                        club_predictor is not None
                         and
-                        club_predictor.df
-                        is not None
+                        club_predictor.df is not None
                     )
-
                     else 0
                 ),
         },
@@ -2706,9 +4237,23 @@ async def model_status():
                     API_FOOTBALL_KEY
                 ),
 
+            "integration":
+                "API-Football + TikaML",
+
+            "current_data": [
+
+                "fixtures",
+                "standings",
+                "form",
+                "home_away",
+                "h2h",
+                "odds",
+            ],
+
             "supported_leagues":
                 [
                     {
+
                         "id":
                             league_id,
 
@@ -2749,13 +4294,11 @@ async def model_status():
                         .model
                         .attack
                     )
-
                     if (
                         national_api
                         .state
                         .model
                     )
-
                     else 0
                 ),
         },
